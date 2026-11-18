@@ -1,0 +1,952 @@
+<!doctype html><html><head><meta charset="utf-8">
+<style>html,body{margin:0;height:100%;overflow:hidden;background:#051726}canvas{display:block;width:100%;height:100%}</style>
+</head><body><canvas id="c"></canvas><script>
+'use strict';
+const A = window.ARGS || (location.hash.length > 1 ? JSON.parse(decodeURIComponent(location.hash.slice(1))) : {});
+const LB = Object.assign({
+  abrams: 'MAIN BATTLE TANK', abramsSub: 'FORCEFIELD', bradley: 'INFANTRY FIGHTING VEHICLE', bradleySub: 'FORCEFIELD · INTERCEPTOR POD',
+  squad: 'SQUAD', uas: 'EDGEISR · ISR', hostile: 'HOSTILE', sharing: 'TARGET SHARING', shared: 'RE-ID',
+  swarm: 'SWARM LAUNCH', handoff: 'HANDOFF', launch: 'EDGEGUIDE', lock: 'RE-ID LOCK', cued: 'CUED', homing: 'HOMING', done: 'SWARM DEFEATED',
+  feedUas: 'EDGEISR · ISR FEED', feedFF: 'FORCEFIELD · SIGHT', feedSeeker: 'EDGEGUIDE · SEEKER', track: 'TRACK', engage: 'ENGAGE',
+  ffTitle: 'FORCEFIELD', ffSub: 'AI KIT ON THE RCWS', egTitle: 'EDGEGUIDE', egSub: 'AXON AI CORE ON BOARD', core: 'AI CORE', seeker: 'SEEKER',
+  nodes: [{ title: 'EDGEISR', sub: 'Detects and tracks' }, { title: 'FORCEFIELD', sub: 'Protects its platform' },
+    { title: 'EDGEGUIDE', sub: 'Seeks and strikes' }],
+  links: ['TARGET SHARING', 'HAND-OFF'], system: 'ONE SYSTEM'
+}, A.labels || {});
+const C = { cyan: '#53C6DD', steel: '#A3C0D6', red: '#FF5A4E', green: '#00FF88', white: '#FFFFFF', text2: '#DFE5EC',
+  text3: '#C7D4E5', muted: '#9AA7B4', fire: '#FFC857', ink: '#051726' };
+const FONT = 'Arial, Helvetica, sans-serif', D2R = Math.PI / 180, TAU = Math.PI * 2;
+
+/* ---------- small maths ---------- */
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const sm = u => { u = clamp(u, 0, 1); return u * u * (3 - 2 * u); };
+const eo = u => 1 - Math.pow(1 - clamp(u, 0, 1), 3);
+const lerp = (a, b, u) => a + (b - a) * u;
+const env = (t, a, b, fi, fo) => (t < a || t > b) ? 0 : Math.min(fi ? sm((t - a) / fi) : 1, fo ? sm((b - t) / fo) : 1);
+const angLerp = (a, b, u) => { const d = ((b - a + Math.PI * 3) % TAU) - Math.PI; return a + d * u; };
+function rng(seed) { return () => { seed |= 0; seed = seed + 0x6D2B79F5 | 0; let x = Math.imul(seed ^ seed >>> 15, 1 | seed);
+  x = x + Math.imul(x ^ x >>> 7, 61 | x) ^ x; return ((x ^ x >>> 14) >>> 0) / 4294967296; }; }
+const hx = h => [parseInt(h.slice(1, 3), 16), parseInt(h.slice(3, 5), 16), parseInt(h.slice(5, 7), 16)];
+const rgba = (hex, a) => { const c = hx(hex); return 'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',' + a + ')'; };
+const va = (a, b) => [a[0] + b[0], a[1] + b[1], a[2] + b[2]];
+const vs = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+const vk = (a, k) => [a[0] * k, a[1] * k, a[2] * k];
+const vd = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+const vx = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+const vl = a => Math.hypot(a[0], a[1], a[2]);
+const vn = a => { const l = vl(a) || 1; return [a[0] / l, a[1] / l, a[2] / l]; };
+const vlp = (a, b, u) => [lerp(a[0], b[0], u), lerp(a[1], b[1], u), lerp(a[2], b[2], u)];
+const bz2 = (p, q, r, u) => { const a = (1 - u) * (1 - u), b = 2 * (1 - u) * u, c = u * u; return [a * p[0] + b * q[0] + c * r[0], a * p[1] + b * q[1] + c * r[1], a * p[2] + b * q[2] + c * r[2]]; };
+const bz3 = (p, q, r, s, u) => { const w = 1 - u, a = w * w * w, b = 3 * w * w * u, c = 3 * w * u * u, d = u * u * u;
+  return [a * p[0] + b * q[0] + c * r[0] + d * s[0], a * p[1] + b * q[1] + c * r[1] + d * s[1], a * p[2] + b * q[2] + c * r[2] + d * s[2]]; };
+// 3x4 affine matrices, row major
+function mm(a, b) { const r = new Array(12); for (let i = 0; i < 3; i++) { const o = i * 4; for (let j = 0; j < 4; j++)
+  r[o + j] = a[o] * b[j] + a[o + 1] * b[4 + j] + a[o + 2] * b[8 + j] + (j === 3 ? a[o + 3] : 0); } return r; }
+const mul = (...ms) => ms.reduce(mm);
+const MT = (x, y, z) => [1, 0, 0, x, 0, 1, 0, y, 0, 0, 1, z];
+const MS = k => [k, 0, 0, 0, 0, k, 0, 0, 0, 0, k, 0];
+const MZ = a => { const c = Math.cos(a), s = Math.sin(a); return [c, -s, 0, 0, s, c, 0, 0, 0, 0, 1, 0]; };       // heading
+const MP = a => { const c = Math.cos(a), s = Math.sin(a); return [c, 0, -s, 0, 0, 1, 0, 0, s, 0, c, 0]; };       // pitch up: +x tips to +z
+const MX = a => { const c = Math.cos(a), s = Math.sin(a); return [1, 0, 0, 0, 0, c, -s, 0, 0, s, c, 0]; };       // roll
+const ap = (m, p) => [m[0] * p[0] + m[1] * p[1] + m[2] * p[2] + m[3], m[4] * p[0] + m[5] * p[1] + m[6] * p[2] + m[7], m[8] * p[0] + m[9] * p[1] + m[10] * p[2] + m[11]];
+const cols = (X, Y, Z, o) => [X[0], Y[0], Z[0], o[0], X[1], Y[1], Z[1], o[1], X[2], Y[2], Z[2], o[2]];
+// a bone from o along dir: its own -z runs down the bone, +x faces forward (side is the figure's left)
+function boneM(o, dir, side) { const Z = vk(vn(dir), -1); let X = vx(side, Z); if (vl(X) < 1e-6) X = vx([1, 0, 0], Z); X = vn(X); return cols(X, vx(Z, X), Z, o); }
+// a frame at o with +x along xd and +z as near up as it can be (weapons)
+function axisM(o, xd) { const X = vn(xd); let Y = vx([0, 0, 1], X); if (vl(Y) < 1e-6) Y = [0, 1, 0]; Y = vn(Y); return cols(X, Y, vx(X, Y), o); }
+function ik2(S, H, a, b, pole) {                                         // two bones from S reaching for H, the joint bending toward pole
+  const D = vs(H, S), d0 = vl(D) || 1e-6, dn = vk(D, 1 / d0), d = clamp(d0, Math.abs(a - b) + 1e-3, a + b - 1e-3);
+  const x = (a * a - b * b + d * d) / (2 * d), h = Math.sqrt(Math.max(0, a * a - x * x));
+  let pp = vs(pole, vk(dn, vd(pole, dn))); pp = vl(pp) < 1e-6 ? [0, 0, 1] : vn(pp);
+  return { J: va(va(S, vk(dn, x)), vk(pp, h)), E: va(S, vk(dn, d)) };
+}
+
+/* ---------- camera, projection, clipping ---------- */
+function mkCam(eye, at, fov, vp, ox, oy) {
+  const f = vn(vs(at, eye)); let r = vx(f, [0, 0, 1]); if (vl(r) < 1e-6) r = [1, 0, 0]; r = vn(r); const u = vx(r, f);
+  return { eye, f, r, u, F: (vp.h / 2) / Math.tan(fov * D2R / 2), cx: vp.x + vp.w / 2 + (ox || 0), cy: vp.y + vp.h / 2 + (oy || 0), near: 0.25 };
+}
+const toC = (c, p) => { const d = vs(p, c.eye); return [vd(d, c.r), vd(d, c.u), vd(d, c.f)]; };
+const scr = (c, q) => [c.cx + q[0] / q[2] * c.F, c.cy - q[1] / q[2] * c.F, q[2]];
+const P2 = (c, p) => { const q = toC(c, p); return q[2] < c.near ? null : scr(c, q); };
+function clipN(cs, n) { const o = [];
+  for (let i = 0; i < cs.length; i++) { const a = cs[i], b = cs[(i + 1) % cs.length], ia = a[2] >= n, ib = b[2] >= n;
+    if (ia) o.push(a); if (ia !== ib) o.push(vlp(a, b, (n - a[2]) / (b[2] - a[2]))); }
+  return o; }
+function projPoly(c, P) { const cs = P.map(p => toC(c, p)), k = cs.some(q => q[2] < c.near) ? clipN(cs, c.near) : cs; return k.length < 3 ? null : k.map(q => scr(c, q)); }
+function projSeg(c, a, b) { let p = toC(c, a), q = toC(c, b); if (p[2] < c.near && q[2] < c.near) return null;
+  if (p[2] < c.near) p = vlp(p, q, (c.near - p[2]) / (q[2] - p[2])); else if (q[2] < c.near) q = vlp(q, p, (c.near - q[2]) / (p[2] - q[2]));
+  return [scr(c, p), scr(c, q)]; }
+function hull(P) { if (P.length < 3) return P; P = P.slice().sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  const cr = (o, a, b) => (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]), lo = [], up = [];
+  for (const p of P) { while (lo.length >= 2 && cr(lo[lo.length - 2], lo[lo.length - 1], p) <= 0) lo.pop(); lo.push(p); }
+  for (let i = P.length - 1; i >= 0; i--) { const p = P[i]; while (up.length >= 2 && cr(up[up.length - 2], up[up.length - 1], p) <= 0) up.pop(); up.push(p); }
+  lo.pop(); up.pop(); return lo.concat(up); }
+
+/* ---------- meshes: convex solids, faces counter-clockwise seen from outside ---------- */
+const BOXF = [[4, 5, 6, 7], [0, 3, 2, 1], [0, 1, 5, 4], [1, 2, 6, 5], [2, 3, 7, 6], [3, 0, 4, 7]];
+const boxW = (x0, y0, z0, x1, y1, z1) => ({ v: [[x0, y0, z0], [x1, y0, z0], [x1, y1, z0], [x0, y1, z0], [x0, y0, z1], [x1, y0, z1], [x1, y1, z1], [x0, y1, z1]], f: BOXF });
+const boxC = (cx, cy, z0, sx, sy, sz) => boxW(cx - sx / 2, cy - sy / 2, z0, cx + sx / 2, cy + sy / 2, z0 + sz);
+function prismM(poly, z0, z1) { const n = poly.length, v = [];       // a top-view outline extruded upwards
+  poly.forEach(p => v.push([p[0], p[1], z0])); poly.forEach(p => v.push([p[0], p[1], z1]));
+  const f = [poly.map((_, i) => n + i), poly.map((_, i) => n - 1 - i)];
+  for (let i = 0; i < n; i++) { const j = (i + 1) % n; f.push([i, j, n + j, n + i]); }
+  return { v, f }; }
+function profM(prof, w) { const n = prof.length, h = w / 2, v = [];  // a side profile (x, z) extruded across the width
+  prof.forEach(p => v.push([p[0], -h, p[1]])); prof.forEach(p => v.push([p[0], h, p[1]]));
+  const f = [prof.map((_, i) => i), prof.map((_, i) => 2 * n - 1 - i)];
+  for (let i = 0; i < n; i++) { const j = (i + 1) % n; f.push([i, n + i, n + j, j]); }
+  return { v, f }; }
+const mv = (m, M) => ({ v: m.v.map(p => ap(M, p)), f: m.f });          // a mesh moved into place once
+const ring8 = (r, x0, y0) => Array.from({ length: 8 }, (_, i) => { const a = (i + 0.5) / 8 * TAU; return [(x0 || 0) + r * Math.cos(a), (y0 || 0) + r * Math.sin(a)]; });
+function halfWheel(x0, r, zc, zt) { const P = [[x0 - r, zt]];           // a road wheel below the skirt, side profile
+  for (let a = 200; a <= 340; a += 35) P.push([x0 + r * Math.cos(a * D2R), zc + r * Math.sin(a * D2R)]); P.push([x0 + r, zt]); return P; }
+const wheels = (xs, r, zc, zt, y) => xs.flatMap(x => [1, -1].map(s => ({ m: mv(profM(halfWheel(x, r, zc, zt), 0.07), MT(0, s * y, 0)), mat: 'wheel' })));
+
+/* ---------- materials: navy and steel for the world, cyan for Axon, red for the adversary; heat for the sensor views ---------- */
+const MAT = {
+  bld: { rgb: [24, 60, 94], top: [40, 92, 134], heat: 0.2, heatTop: 0.28, edge: 'rgba(83,198,221,0.17)' },
+  roof: { rgb: [30, 72, 110], heat: 0.36, edge: 'rgba(83,198,221,0.14)' },
+  hull: { rgb: [46, 108, 150], heat: 0.52, edge: 'rgba(83,198,221,0.72)' },
+  turret: { rgb: [56, 126, 172], heat: 0.47, edge: 'rgba(83,198,221,0.72)' },
+  track: { rgb: [14, 40, 62], heat: 0.64, edge: 'rgba(83,198,221,0.38)' },
+  wheel: { rgb: [30, 62, 88], heat: 0.66, edge: 'rgba(83,198,221,0.32)' },
+  rack: { rgb: [22, 52, 78], heat: 0.4, edge: 'rgba(83,198,221,0.42)' },
+  steel: { rgb: [150, 178, 200], heat: 0.42, edge: null },
+  rcws: { rgb: [118, 152, 176], top: [152, 184, 206], heat: 0.5, edge: 'rgba(223,245,250,0.55)' },
+  gun: { rgb: [58, 76, 92], heat: 0.62, edge: 'rgba(163,192,214,0.4)' },
+  sensor: { rgb: [83, 198, 221], heat: 0.56, edge: 'rgba(223,245,250,0.9)' },
+  pod: { rgb: [58, 152, 188], heat: 0.46, edge: 'rgba(223,245,250,0.85)' },
+  hole: { rgb: [5, 18, 30], heat: 0.12, edge: null },
+  usCloth: { rgb: [78, 176, 198], heat: 0.95, edge: null },
+  usGear: { rgb: [42, 112, 136], heat: 0.8, edge: null },
+  arms: { rgb: [30, 42, 52], heat: 0.55, edge: null },
+  foeCloth: { rgb: [104, 62, 70], heat: 0.95, edge: null },
+  foeGear: { rgb: [64, 42, 50], heat: 0.8, edge: null },
+  foeClothLit: { rgb: [255, 90, 78], heat: 0.96, edge: null },
+  foeGearLit: { rgb: [172, 56, 50], heat: 0.82, edge: null },
+  crate: { rgb: [74, 54, 52], top: [96, 66, 62], heat: 0.4, edge: 'rgba(255,90,78,0.4)' },
+  drone: { rgb: [255, 90, 78], top: [255, 128, 112], heat: 0.86, edge: 'rgba(255,214,206,0.45)' },
+  uas: { rgb: [178, 206, 226], heat: 0.5, edge: 'rgba(83,198,221,0.85)' },
+  eg: { rgb: [176, 204, 222], top: [214, 232, 244], heat: 0.62, edge: 'rgba(83,198,221,0.9)' },          // the EdgeGuide drone
+  egGlass: { rgb: [12, 36, 54], heat: 0.4, edge: 'rgba(223,245,250,0.9)' },
+  core: { rgb: [83, 198, 221], top: [170, 236, 248], heat: 0.9, edge: 'rgba(223,245,250,0.95)' },        // the AI core inside it
+  egIn: { rgb: [74, 96, 114], heat: 0.5, edge: 'rgba(163,192,214,0.5)' }
+};
+const LT = vn([-0.5, 0.35, 1]);                                          // light from the north-west, high
+const SD = [0.5, -0.35];                                                  // shadows fall south-east, metres per metre of height
+const cstr = (c, k) => 'rgb(' + Math.min(255, c[0] * k | 0) + ',' + Math.min(255, c[1] * k | 0) + ',' + Math.min(255, c[2] * k | 0) + ')';
+function shade(m, n, mode, tone) {
+  const d = Math.max(0, vd(n, LT)), top = n[2] > 0.7;
+  if (mode === 'ir') { const h = (top && m.heatTop != null ? m.heatTop : m.heat) * (0.8 + 0.25 * d) * (tone || 1), v = clamp(h, 0, 1) * 255 | 0; return 'rgb(' + v + ',' + v + ',' + v + ')'; }
+  return cstr(top && m.top ? m.top : m.rgb, (0.36 + 0.64 * d) * (tone || 1));
+}
+
+/* ---------- the world: metres, x east, y north, z up; vehicles, people and the UAS larger than life, as on a sand table ---------- */
+const TB = { x0: -150, x1: 140, y0: -112, y1: 112, th: 8 };
+const R0 = rng(11), BLD = [];
+const addB = (x0, y0, x1, y1, h) => BLD.push({ x0, y0, x1, y1, h, tone: 0.86 + R0() * 0.26 });
+for (let i = 0; i < 5; i++) for (let j = 0; j < 4; j++) {                 // a town of 16 m blocks and 8 m streets
+  const bx = i * 24, by = j * 24;
+  if (i === 0 && j === 1) { addB(bx + 9.5, by + 0.8, bx + 15.2, by + 15.2, 7); addB(bx + 0.8, by + 11, bx + 9, by + 15.2, 6); continue; }   // the squad's yard
+  if (i === 3 && j === 1) { addB(bx + 2, by + 2, bx + 14, by + 14, 28); continue; }                                                        // a tower
+  if (i === 1 && j === 3) { addB(bx + 1, by + 1, bx + 15, by + 15, 19); continue; }
+  const n = 1 + Math.floor(R0() * 3), alongX = R0() < 0.5, low = i === 0 ? 0.6 : 1;
+  for (let k = 0; k < n; k++) {
+    let x0 = bx, x1 = bx + 16, y0 = by, y1 = by + 16;
+    if (alongX) { x0 = bx + k * 16 / n; x1 = bx + (k + 1) * 16 / n; } else { y0 = by + k * 16 / n; y1 = by + (k + 1) * 16 / n; }
+    if (n > 1 && R0() < 0.12) continue;                                   // an open lot
+    addB(x0 + 0.8, y0 + 0.8, x1 - 0.8, y1 - 0.8, (5 + R0() * 11) * low);
+  }
+}
+const nearestRoof = (x, y) => { let best = null, bd = 1e9;
+  for (const b of BLD) { const cx = (b.x0 + b.x1) / 2, cy = (b.y0 + b.y1) / 2, d = Math.hypot(cx - x, cy - y); if (d < bd && b.h < 20) { bd = d; best = [cx, cy, b.h]; } }
+  return best; };
+const BM = BLD.map(b => ({ m: boxW(b.x0, b.y0, 0, b.x1, b.y1, b.h), tone: b.tone }));
+const ROOF = [];
+BLD.forEach(b => { if (R0() < 0.4 && b.x1 - b.x0 > 4.5 && b.y1 - b.y0 > 4.5) { const cx = lerp(b.x0, b.x1, 0.25 + R0() * 0.5), cy = lerp(b.y0, b.y1, 0.25 + R0() * 0.5);
+  ROOF.push(boxC(cx, cy, b.h, 1.8, 1.4, 1.1)); } });
+const SHAD = BLD.map(b => { const P = [[b.x0, b.y0], [b.x1, b.y0], [b.x1, b.y1], [b.x0, b.y1]], Q = P.concat(P.map(p => [p[0] + SD[0] * b.h, p[1] + SD[1] * b.h]));
+  return hull(Q).map(p => [p[0], p[1], 0.03]); });
+// the enemy, in the order the UAS finds them (T1..T5): a fighter walking north up a street, an RPG gunner and a rifleman on
+// the roofs, two drone operators beside their launch crates (T4 on a roof, T5 in the street)
+const HOS = [[44, 68, 0], nearestRoof(52, 56), nearestRoof(84, 78), nearestRoof(104, 32), [68, 44, 0]];
+const DET = [7.0, 8.2, 9.4, 10.6, 11.8];
+const hosAt = (i, t) => i === 0 ? [44, 62.85 + 0.45 * t, 0] : HOS[i];
+const CRATE = [va(HOS[4], [-2.4, 1.1, 0]), va(HOS[3], [-2.2, -1.2, 0])];
+// the squad holds a yard on the west edge of the town, facing out
+const SQUAD = [{ p: [8.2, 25.6, 0], h: 0.05, pose: 'kneel' }, { p: [5.0, 25.2, 0], h: -0.7, pose: 'stand' }, { p: [2.2, 27.6, 0], h: -2.3, pose: 'kneel' },
+  { p: [4.2, 30.8, 0], h: 0.5, pose: 'stand', radio: true }, { p: [6.9, 33.4, 0], h: 1.35, pose: 'kneel' }];
+const SQC = [5, 29.6, 0];
+
+// the approach road and the two vehicles on it
+const RP = [[-140, -98], [-96, -84], [-62, 6], [-8, 20]];
+const ROAD = (() => { const pts = [], len = [0];
+  for (let i = 0; i <= 90; i++) { const u = i / 90, w = 1 - u, a = w * w * w, b = 3 * w * w * u, c = 3 * w * u * u, d = u * u * u;
+    pts.push([a * RP[0][0] + b * RP[1][0] + c * RP[2][0] + d * RP[3][0], a * RP[0][1] + b * RP[1][1] + c * RP[2][1] + d * RP[3][1]]);
+    if (i) len.push(len[i - 1] + Math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1])); }
+  return { pts, len, L: len[90] }; })();
+function roadAt(d) { d = clamp(d, 0, ROAD.L); let i = 1; while (i < 90 && ROAD.len[i] < d) i++;
+  const u = (d - ROAD.len[i - 1]) / ((ROAD.len[i] - ROAD.len[i - 1]) || 1), p = ROAD.pts[i - 1], q = ROAD.pts[i];
+  return { p: [lerp(p[0], q[0], u), lerp(p[1], q[1], u), 0], h: Math.atan2(q[1] - p[1], q[0] - p[0]) }; }
+const VS = 1.9, RCS = 1.5;
+const ABR = { d0: 58, d1: ROAD.L - 6, cue: 1, targets: [0, 1, 2], rcws: [-0.9, -0.95, 2.3], parts: [
+  { m: boxC(0, 1.52, 0, 7.9, 0.72, 1.0), mat: 'track' }, { m: boxC(0, -1.52, 0, 7.9, 0.72, 1.0), mat: 'track' },
+  { m: profM([[-3.95, 0.4], [3.35, 0.4], [3.98, 0.95], [3.05, 1.38], [-3.95, 1.38]], 3.3), mat: 'hull' },
+  { m: boxC(0.25, 1.93, 0.45, 7.3, 0.08, 0.6), mat: 'hull' }, { m: boxC(0.25, -1.93, 0.45, 7.3, 0.08, 0.6), mat: 'hull' },          // side skirts
+  { m: prismM([[-2.9, -1.7], [0.9, -1.78], [2.15, -0.75], [2.15, 0.75], [0.9, 1.78], [-2.9, 1.7]], 1.38, 2.3), mat: 'turret' },
+  { m: boxW(-3.72, -1.6, 1.5, -2.9, 1.6, 2.16), mat: 'rack' },                                                                   // bustle rack
+  { m: boxC(2.3, 0, 1.5, 0.42, 0.98, 0.66), mat: 'turret' },                                                                    // gun mantlet
+  { m: boxC(4.4, 0, 1.7, 4.6, 0.26, 0.26), mat: 'steel' }, { m: boxC(4.3, 0, 1.66, 0.6, 0.36, 0.34), mat: 'steel' },            // gun, bore evacuator
+  { m: boxC(6.62, 0, 1.68, 0.2, 0.32, 0.3), mat: 'steel' },
+  { m: boxC(-0.2, 0.95, 2.3, 0.7, 0.55, 0.45), mat: 'turret' },                                                                 // sight head
+  { m: boxC(-1.15, 0.7, 2.3, 0.6, 0.6, 0.07), mat: 'steel' },                                                                   // loader's hatch
+  { m: boxC(1.3, 1.62, 1.95, 0.32, 0.2, 0.22), mat: 'steel' }, { m: boxC(1.3, -1.62, 1.95, 0.32, 0.2, 0.22), mat: 'steel' }]    // smoke dischargers
+  .concat(wheels([-3.0, -2.0, -1.0, 0, 1.0, 2.0, 3.0], 0.34, 0.38, 0.45, 1.9)) };
+const TUBES = [[-2.68, 0.71], [-1.92, 0.71], [-2.68, -0.01], [-1.92, -0.01]];
+const BRD = { d0: 32, d1: ROAD.L - 27, cue: 3, targets: [3, 4], rcws: [1.55, 1.05, 2.05], parts: [
+  { m: boxC(0, 1.45, 0, 6.6, 0.66, 1.0), mat: 'track' }, { m: boxC(0, -1.45, 0, 6.6, 0.66, 1.0), mat: 'track' },
+  { m: profM([[-3.3, 0.4], [2.55, 0.4], [3.3, 1.05], [2.85, 2.05], [-3.3, 2.05]], 3.15), mat: 'hull' },
+  { m: boxC(0.1, 1.82, 0.45, 6.0, 0.07, 0.55), mat: 'hull' }, { m: boxC(0.1, -1.82, 0.45, 6.0, 0.07, 0.55), mat: 'hull' },
+  { m: prismM([[-0.6, -1.25], [1.1, -1.25], [1.45, -0.8], [1.45, 0.45], [1.1, 0.75], [-0.6, 0.75]], 2.05, 2.8), mat: 'turret' },
+  { m: boxC(2.75, -0.25, 2.32, 2.6, 0.16, 0.16), mat: 'steel' },
+  { m: boxC(0.3, 1.02, 2.12, 1.5, 0.42, 0.45), mat: 'hull' },
+  { m: boxC(-2.3, 0.35, 2.05, 1.7, 1.5, 0.75), mat: 'pod' }]
+  .concat(TUBES.map(p => ({ m: boxC(p[0], p[1], 2.8, 0.52, 0.52, 0.035), mat: 'hole' })))
+  .concat(wheels([-2.5, -1.5, -0.5, 0.5, 1.5, 2.5], 0.3, 0.34, 0.45, 1.79)) };
+// the remote weapon station, in its own metres: a turntable and cradle that turn, a .50 cal, its ammunition box and the
+// EO and thermal sight that elevate together about the trunnion (PIV)
+const PIV = 0.56;
+const RCP = {
+  turn: [{ m: prismM(ring8(0.36), 0, 0.16), mat: 'rcws' }, { m: boxC(0, 0, 0.16, 0.4, 0.46, 0.18), mat: 'rcws' },
+    { m: boxC(0, 0.14, 0.34, 0.26, 0.06, 0.32), mat: 'rcws' }, { m: boxC(0, -0.14, 0.34, 0.26, 0.06, 0.32), mat: 'rcws' }],
+  gun: [{ m: boxC(-0.02, 0, -0.1, 0.62, 0.2, 0.2), mat: 'gun' }, { m: boxC(-0.04, 0, 0.1, 0.5, 0.16, 0.04), mat: 'gun' },
+    { m: boxC(0.4, 0, -0.04, 0.22, 0.1, 0.1), mat: 'gun' }, { m: boxC(0.98, 0, -0.04, 1.12, 0.065, 0.065), mat: 'gun' },
+    { m: boxC(1.59, 0, -0.04, 0.1, 0.1, 0.1), mat: 'gun' }],
+  side: [{ m: boxC(-0.04, 0.29, -0.12, 0.34, 0.2, 0.3), mat: 'rcws' }, { m: boxC(0.08, -0.31, -0.06, 0.42, 0.22, 0.3), mat: 'sensor' },
+    { m: boxC(0.3, -0.36, 0.04, 0.03, 0.09, 0.11), mat: 'hole' }, { m: boxC(0.3, -0.25, 0.1, 0.03, 0.07, 0.07), mat: 'hole' }]
+};
+const MUZ = [1.66, 0, -0.04], LENS = [0.32, -0.33, 0.09], EJECT = [0.02, -0.12, -0.06];
+const LID = boxC(0, 0, 0, 0.56, 0.56, 0.08);
+const vstate = (V, t) => roadAt(lerp(V.d0, V.d1, Math.sin(Math.PI / 2 * clamp(t / 7, 0, 1))));    // rolling from the start, braking to a halt at 7 s
+const vmat = s => mul(MT(s.p[0], s.p[1], 0), MZ(s.h), MS(VS));
+const ABR_END = vstate(ABR, 99), BRD_END = vstate(BRD, 99);
+const UASP = [profM([[-3.0, -0.38], [2.3, -0.38], [3.1, 0], [2.3, 0.4], [-3.0, 0.22]], 0.72), boxC(0.25, 0, 0.02, 1.15, 10.4, 0.13),
+  boxC(-2.75, 0, 0.1, 0.75, 3.4, 0.09), boxC(-2.85, 0, 0.18, 0.8, 0.09, 1.05), boxC(1.6, 0, -0.62, 0.42, 0.42, 0.34)];
+
+// people: jointed figures in their own metres (x forward, y left), posed by hip height, lean, feet and the weapon in the
+// torso frame; the hands reach the weapon's grips. FIG_S scales them up like the vehicles.
+const FIG_S = 2.0;
+const FB = {
+  thigh: boxC(0, 0, -0.44, 0.15, 0.15, 0.44), shin: boxC(0, 0, -0.42, 0.12, 0.12, 0.42), boot: boxC(0.05, 0, -0.47, 0.25, 0.12, 0.08),
+  pelvis: boxC(0, 0, -0.1, 0.2, 0.32, 0.2), torso: boxC(0, 0, 0, 0.22, 0.36, 0.52), neck: boxC(0, 0, 0.48, 0.1, 0.1, 0.1),
+  plate: boxC(0.02, 0, 0.13, 0.3, 0.4, 0.35), pack: boxC(-0.2, 0, 0.12, 0.13, 0.3, 0.34), rig: boxC(0.06, 0, 0.16, 0.24, 0.34, 0.2),
+  head: boxC(0.01, 0, 0.03, 0.19, 0.17, 0.22), helmet: [prismM(ring8(0.135), 0.1, 0.2), prismM(ring8(0.1), 0.2, 0.28)],
+  hood: boxC(-0.01, 0, 0.02, 0.23, 0.21, 0.26), upArm: boxC(0, 0, -0.29, 0.09, 0.09, 0.29), foreArm: boxC(0, 0, -0.27, 0.08, 0.08, 0.27)
+};
+const WPN = {                                                             // along +x; grip for the right hand, fore for the left
+  rifle: { parts: [boxC(0.17, 0, 0.02, 0.8, 0.045, 0.07), boxC(0.12, 0, -0.07, 0.06, 0.035, 0.12), boxC(-0.3, 0, -0.01, 0.17, 0.04, 0.12)], grip: [0, 0, -0.03], fore: [0.3, 0, -0.01] },
+  ak: { parts: [boxC(0.15, 0, 0.02, 0.84, 0.045, 0.07), mv(boxC(0, 0, -0.08, 0.07, 0.035, 0.15), mul(MT(0.17, 0, -0.01), MP(0.4))), boxC(-0.32, 0, -0.01, 0.17, 0.04, 0.12)], grip: [0, 0, -0.03], fore: [0.3, 0, -0.01] },
+  rpg: { parts: [boxC(0.1, 0, 0, 1.0, 0.1, 0.1), boxC(0.7, 0, -0.03, 0.26, 0.17, 0.17)], grip: [0.12, 0, -0.08], fore: [0.42, 0, -0.07] },
+  ctrl: { parts: [boxC(0.02, 0, 0, 0.14, 0.26, 0.05)], grip: [0, -0.12, 0.02], fore: [0, 0.12, 0.02] }
+};
+const W_READY = { o: [0.16, -0.05, 0.36], d: [0.92, 0.12, -0.32] }, W_AIM = { o: [0.12, -0.13, 0.44], d: [1, 0.03, 0] };
+const KNEEL = { hz: 0.5, feet: [[0.46, 0.15, 0.07], [-0.42, -0.12, 0.1]], kp: [[1, 0, 0.5], [1, 0, -1.2]] };
+const POSE = {
+  stand: { hz: 0.88, lean: 0.05, feet: [[0.07, 0.14, 0.07], [-0.05, -0.14, 0.07]], w: W_READY },
+  kneel: Object.assign({ lean: 0.12, w: W_AIM }, KNEEL),
+  cover: { hz: 0.56, lean: 0.55, feet: [[0.3, 0.16, 0.07], [-0.14, -0.15, 0.07]], w: W_READY },
+  rpg: Object.assign({ lean: 0.08, w: { o: [-0.12, -0.19, 0.53], d: [1, 0, 0.06] } }, KNEEL),
+  op: Object.assign({ lean: 0.25, w: { o: [0.36, 0, 0.18], d: [1, 0, -0.15] } }, KNEEL)
+};
+function walkPose(ph) { const f = q => [0.27 * Math.sin(q), 0.07 + 0.09 * Math.max(0, Math.cos(q))], L = f(ph), R = f(ph + Math.PI);
+  return { hz: 0.87 - 0.015 * Math.cos(2 * ph), lean: 0.08, feet: [[L[0], 0.13, L[1]], [R[0], -0.13, R[1]]], w: W_READY }; }
+function blendPose(P, Q, u) { if (u <= 0) return P; if (u >= 1) return Q;
+  const kp = (P.kp || Q.kp) ? [0, 1].map(k => vlp((P.kp || [[1, 0, 0.5], [1, 0, 0.5]])[k], (Q.kp || [[1, 0, 0.5], [1, 0, 0.5]])[k], u)) : null;
+  return { hz: lerp(P.hz, Q.hz, u), lean: lerp(P.lean, Q.lean, u), feet: [0, 1].map(k => vlp(P.feet[k], Q.feet[k], u)), kp,
+    w: { o: vlp(P.w.o, Q.w.o, u), d: vlp(P.w.d, Q.w.d, u) } }; }
+const CRM = boxC(0, 0, 0, 0.9, 0.62, 0.42);                             // a launch crate, figure metres
+// a quadcopter with a charge slung under it, larger than life
+const DSC = 2.4;
+const QM = [boxC(0, 0, -0.07, 0.34, 0.22, 0.13), boxC(0.02, 0, -0.21, 0.24, 0.12, 0.15)]
+  .concat([1, -1].map(s => mv(boxC(0, 0, -0.03, 1.0, 0.06, 0.04), MZ(s * Math.PI / 4))))
+  .concat([[1, 1], [1, -1], [-1, 1], [-1, -1]].map(([a, b]) => boxC(a * 0.354, b * 0.354, -0.04, 0.1, 0.1, 0.09)));
+// the EdgeGuide attack drone, in metres along +x (the nose): a tube-launched body, a seeker window, four pop-out wings, a
+// fin and a pusher prop; inside, the AI core wired to the seeker, the warhead, the battery and the motor (seen when the
+// skin turns see-through)
+function frustX(r0, r1, x0, x1) { const a = ring8(r0), b = ring8(r1), v = [];      // an eight-sided frustum along x
+  a.forEach(p => v.push([x0, p[0], p[1]])); b.forEach(p => v.push([x1, p[0], p[1]]));
+  const f = [a.map((_, i) => 7 - i), b.map((_, i) => 8 + i)];
+  for (let i = 0; i < 8; i++) { const j = (i + 1) % 8; f.push([i, j, 8 + j, 8 + i]); }
+  return { v, f }; }
+const EGSC = 1.15;
+const EGB = [frustX(0.15, 0.15, -1.0, 1.0), frustX(0.15, 0.075, 1.0, 1.2), frustX(0.09, 0.15, -1.12, -1.0), boxW(-0.98, -0.012, 0.12, -0.72, 0.012, 0.42)];
+const EGW = frustX(0.075, 0.05, 1.2, 1.235);
+const EGWING = { fl: boxW(-0.1, 0, -0.0125, 0.1, 0.95, 0.0125), fr: boxW(-0.1, -0.95, -0.0125, 0.1, 0, 0.0125),
+  rl: boxW(-0.085, 0, -0.0125, 0.085, 0.75, 0.0125), rr: boxW(-0.085, -0.75, -0.0125, 0.085, 0, 0.0125) };
+const EGIN = [[boxW(-0.08, -0.1, -0.075, 0.42, 0.1, 0.075), 'core'], [boxW(0.95, -0.075, -0.075, 1.13, 0.075, 0.075), 'core'],
+  [boxW(0.5, -0.11, -0.1, 0.92, 0.11, 0.1), 'egIn'], [boxW(-0.72, -0.11, -0.1, -0.14, 0.11, 0.1), 'egIn'], [boxW(-1.05, -0.08, -0.08, -0.8, 0.08, 0.08), 'egIn']];
+
+// terrain dressing: the table, fields, contour rings, a grid
+const FIELDS = (() => { const r = rng(5), o = [];
+  for (let i = 0; i < 9; i++) { const cx = -130 + r() * 110, cy = -100 + r() * 70, w = 14 + r() * 22, h = 10 + r() * 16, a = (r() - 0.5) * 0.6, c = Math.cos(a), s = Math.sin(a);
+    if (Math.hypot(cx + 80, cy + 50) < 22) continue;
+    o.push([[-w, -h], [w, -h], [w, h], [-w, h]].map(p => [cx + p[0] / 2 * c - p[1] / 2 * s, cy + p[0] / 2 * s + p[1] / 2 * c, 0.02])); }
+  return o; })();
+const CONT = (() => { const o = [], r = rng(3);
+  [[-100, 62, 4, 11], [70, -72, 3, 10], [-20, -78, 2, 8]].forEach(([cx, cy, n, s]) => { for (let k = 1; k <= n; k++) {
+    const R = k * s, ph = r() * 6, ring = [];
+    for (let i = 0; i <= 64; i++) { const a = i / 64 * TAU, rr = R * (1 + 0.16 * Math.sin(3 * a + ph) + 0.08 * Math.sin(5 * a + ph * 2)); ring.push([cx + rr * Math.cos(a) * 1.3, cy + rr * Math.sin(a), 0.02]); }
+    o.push(ring); } });
+  return o; })();
+const GRID = (() => { const o = []; for (let x = -140; x <= 140; x += 20) o.push([[x, TB.y0, 0.01], [x, TB.y1, 0.01]]); for (let y = -100; y <= 100; y += 20) o.push([[TB.x0, y, 0.01], [TB.x1, y, 0.01]]); return o; })();
+const TOWNB = [[-3, -3, 0.02], [115, -3, 0.02], [115, 91, 0.02], [-3, 91, 0.02]];
+const ROADP = (() => { const L = [], R = []; ROAD.pts.forEach((p, i) => { const q = ROAD.pts[Math.min(90, i + 1)], o = ROAD.pts[Math.max(0, i - 1)], h = Math.atan2(q[1] - o[1], q[0] - o[0]), nx = -Math.sin(h) * 5.5, ny = Math.cos(h) * 5.5;
+  L.push([p[0] + nx, p[1] + ny, 0.025]); R.push([p[0] - nx, p[1] - ny, 0.025]); }); return L.concat(R.reverse()); })();
+
+/* ---------- the scenario: every position is a function of t (seconds since the slide opened) ---------- */
+const TL = { scan: 6.0, uasIn: 3.0, uasOrbit: 6.0, share: 12.8, swarm: 17.6, zin: 18.3, ff: 20.1, zout: 24.7, wide: 26.5,
+  handoff: 28.2, zin2: 28.9, pod: 30.5, launch: 30.8, xr0: 31.6, xr1: 33.6, zout2: 33.3, wide2: 34.9, lock: 34.2, hit: 36.0, end: 36.8 };
+const PH = [0, TL.scan, TL.share, TL.swarm, TL.ff, TL.handoff, TL.pod, TL.end];        // the beats a forward key jumps to
+const ORB = { c: [66, 52], r: 38, z: 42, w: TAU / 20, th0: Math.PI * 0.12 };
+function uasAt(t) {
+  if (t < TL.uasIn) return null;
+  const E = [ORB.c[0] + ORB.r * Math.cos(ORB.th0), ORB.c[1] + ORB.r * Math.sin(ORB.th0), ORB.z], tg = [-Math.sin(ORB.th0), Math.cos(ORB.th0), 0];
+  if (t < TL.uasOrbit) { const d = ORB.r * ORB.w * (TL.uasOrbit - t); return { p: [E[0] - tg[0] * d, E[1] - tg[1] * d, ORB.z + 10 * sm(d / 60)], h: Math.atan2(tg[1], tg[0]), roll: 0, a: sm((t - TL.uasIn) / 0.5) }; }
+  const th = ORB.th0 + ORB.w * (t - TL.uasOrbit);
+  return { p: [ORB.c[0] + ORB.r * Math.cos(th), ORB.c[1] + ORB.r * Math.sin(th), ORB.z], h: th + Math.PI / 2, roll: -0.32 * sm((t - TL.uasOrbit) / 1.2), a: 1 };
+}
+// the swarm, off the two crates: three at the tank, two at the IFV, one (a slower, looping drone) at the squad
+const L1 = va(CRATE[0], [0, 0, 0.9]), L2 = va(CRATE[1], [0, 0, 0.9]);
+const DR = [
+  { o: L1, to: ABR_END.p, tl: 17.8, kill: 21.4, k: 0.82, sw: 40, h: 13 },        // they bend south, clear of the squad
+  { o: L1, to: ABR_END.p, tl: 18.0, kill: 22.8, k: 0.84, sw: 30, h: 17 },
+  { o: L1, to: ABR_END.p, tl: 18.25, kill: 24.2, k: 0.86, sw: 50, h: 10 },
+  { o: L2, to: BRD_END.p, tl: 17.9, kill: 26.8, k: 0.7, sw: 12, h: 16 },
+  { o: L2, to: BRD_END.p, tl: 18.15, kill: 27.7, k: 0.76, sw: 15, h: 12 },
+  { o: L1, to: SQC, tl: 18.1, kill: TL.hit, k: 0.88, loop: true }];
+DR.forEach(d => { d.dur = (d.kill - d.tl) / d.k; d.P0 = d.o;
+  if (d.loop) { d.P1 = va(d.o, [6, 42, 30]); d.P2 = va(SQC, [40, 36, 24]); d.P3 = va(SQC, [0, 0, 2.5]); return; }
+  const P2 = va(d.to, [0, 0, 2.6]), m = vk(va(d.o, P2), 0.5), h = Math.atan2(P2[1] - d.o[1], P2[0] - d.o[0]);
+  d.P1 = va(m, [-Math.sin(h) * d.sw, Math.cos(h) * d.sw, 2 * d.h]); d.P2 = P2; });
+const dpos = (i, t) => { const d = DR[i], u = clamp((t - d.tl) / d.dur, 0, 1); return d.loop ? bz3(d.P0, d.P1, d.P2, d.P3, u) : bz2(d.P0, d.P1, d.P2, u); };
+const alive = (i, t) => t >= DR[i].tl && t < DR[i].kill;
+const KILL = DR.map((d, i) => dpos(i, d.kill));
+// ForceField: forward, cued to a shared track, searching the sky the swarm comes from, then each drone in turn: acquire,
+// slew, burst, kill
+function rcwsBase(V, s) { return mul(vmat(s), MT(V.rcws[0], V.rcws[1], V.rcws[2]), MS(RCS)); }
+function ffAim(V, t) {
+  const s = vstate(V, t), Mb = rcwsBase(V, s), base = ap(Mb, [0, 0, PIV]);
+  const aim = q => { const d = vs(q, base); return [Math.atan2(d[1], d[0]), Math.atan2(d[2], Math.hypot(d[0], d[1]))]; };
+  const mix = (a, b, u) => [angLerp(a[0], b[0], u), lerp(a[1], b[1], u)];
+  let a = [s.h, 0.03];
+  const cue = aim(va(HOS[V.cue], [0, 0, 1.5]));
+  if (t >= TL.share + 1.0) a = mix(a, cue, sm((t - TL.share - 1.0) / 0.9));
+  const first = DR[V.targets[0]].kill - 1.5, ts = Math.min(t, first);
+  if (t >= TL.swarm + 0.3) { let sc = [0, 0, 0], n = 0;
+    V.targets.forEach(i => { if (alive(i, ts)) { sc = va(sc, dpos(i, ts)); n++; } });
+    if (n) { const q = aim(vk(sc, 1 / n)); a = mix(a, [q[0] + 0.12 * Math.sin(t * 2.1), q[1] + 0.05 * Math.sin(t * 1.6)], sm((t - TL.swarm - 0.3) / 0.8)); } }
+  for (let n = 0; n < V.targets.length; n++) {
+    const i = V.targets[n], d = DR[i], prev = n ? DR[V.targets[n - 1]] : null, acq = d.kill - 1.5, start = prev ? Math.max(acq, prev.kill + 0.05) : acq;
+    if (t < start) break;
+    if (t <= d.kill) return { s, Mb, base, a: mix(a, aim(dpos(i, t)), sm((t - start) / 0.4)), fire: t >= d.kill - 0.75, tgt: i };
+    a = aim(KILL[i]);
+  }
+  const last = DR[V.targets[V.targets.length - 1]].kill;
+  if (t > last) a = mix(a, cue, sm((t - last - 0.5) / 1.4));
+  return { s, Mb, base, a, fire: false, tgt: -1 };
+}
+const azM = ff => mul(ff.Mb, MZ(ff.a[0] - ff.s.h));
+const elM = ff => mul(azM(ff), MT(0, 0, PIV), MP(ff.a[1]));
+const muzzle = ff => ap(elM(ff), MUZ);
+const lensP = ff => ap(elM(ff), LENS);
+const aimDir = ff => [Math.cos(ff.a[0]) * Math.cos(ff.a[1]), Math.sin(ff.a[0]) * Math.cos(ff.a[1]), Math.sin(ff.a[1])];
+// EdgeGuide: out of the IFV's pod (its lid flips open at TL.pod), up to an apex where the wings pop out, then along the
+// shared track to the drone for the squad: slow at first, for the close-up, fast at the end
+const tube0 = () => ap(vmat(BRD_END), [TUBES[0][0], TUBES[0][1], 2.9]);
+const EGA = 6.4, EJ = 0.9;                                                // the apex (metres above the tube) and the time to reach it
+let EGP = null;
+function egPath() { if (!EGP) { const P0 = tube0(), A = va(P0, [0, 0, EGA]), H = dpos(5, TL.hit);
+  EGP = { P0, A, H, C1: va(A, [(H[0] - A[0]) * 0.25, (H[1] - A[1]) * 0.25, 9]), S: vn([-(H[1] - P0[1]), H[0] - P0[0], 0]) }; } return EGP; }
+const egU = t => Math.pow(clamp((t - TL.launch - EJ) / (TL.hit - TL.launch - EJ), 0, 1), 2.1);
+function ipos(t) {
+  if (t < TL.launch) return null;
+  const E = egPath(), te = t - TL.launch;
+  if (te < EJ) return va(E.P0, [0, 0, lerp(-0.2, EGA, eo(te / EJ))]);
+  return bz2(E.A, E.C1, E.H, egU(t));
+}
+function egState(t) {                                                     // where it is, which way it points, wings, prop, see-through
+  const P = ipos(t); if (!P) return null;
+  const E = egPath(), te = t - TL.launch, w = egU(t);
+  const tan = vn(va(vk(vs(E.C1, E.A), 2 * (1 - w)), vk(vs(E.H, E.C1), 2 * w)));
+  const X = vn(vlp([0, 0, 1], tan, sm((te - EJ) / 0.5))), Y = vn(vs(E.S, vk(X, vd(E.S, X))));   // nose up out of the tube, then over
+  return { P, M: mul(cols(X, Y, vx(X, Y), P), MS(EGSC)), wing: sm((te - EJ + 0.1) / 0.4), prop: sm((te - EJ + 0.15) / 0.3), xr: env(t, TL.xr0, TL.xr1, 0.35, 0.45) };
+}
+// where the UAS sensor looks: a sweep over the town, the swarm, then the drone for the squad
+const FPK = [[TL.scan, [26, 46, 0]]].concat(HOS.map((h, i) => [DET[i], h]));     // 3D aim points; the ground footprint uses x and y
+function fpBase(t) {
+  for (let i = 0; i < FPK.length - 1; i++) if (t < FPK[i + 1][0]) return vlp(FPK[i][1], FPK[i + 1][1], sm((t - FPK[i][0]) / (FPK[i + 1][0] - FPK[i][0])));
+  const w = t - DET[4], e = FPK[5][1], k = sm(w / 1.6);
+  return vlp(e, [58 + 16 * Math.sin(w * 0.42), 50 + 11 * Math.sin(w * 0.31 + 1), 0], k);
+}
+function swarmC(t) { let s = [0, 0, 0], n = 0; for (let i = 0; i < 6; i++) if (alive(i, t)) { s = va(s, dpos(i, t)); n++; } return n ? vk(s, 1 / n) : L1; }
+function footprint(t) {
+  if (t < TL.scan) return null;
+  let p = fpBase(t);
+  const ws = env(t, TL.swarm - 0.3, TL.handoff + 0.4, 0.7, 0.8); if (ws > 0) p = vlp(p, swarmC(t), ws);
+  const wd = env(t, TL.handoff - 0.8, TL.hit + 1.4, 0.6, 1.2); if (wd > 0) p = vlp(p, dpos(5, Math.min(t, TL.hit)), wd);
+  return p;
+}
+function feed(t) {                                                       // which sensor the picture-in-picture shows
+  if (t < 6.3) return null;
+  if (t < TL.ff) return { k: 'uas', t0: 6.3 };
+  if (t < DR[2].kill + 0.6) return { k: 'ffA', t0: TL.ff };
+  if (t < DR[4].kill + 0.6) return { k: 'ffB', t0: DR[2].kill + 0.6 };
+  if (t < TL.launch + 0.5) return { k: 'uas', t0: DR[4].kill + 0.6 };
+  if (t < TL.hit + 0.5) return { k: 'seeker', t0: TL.launch + 0.5 };
+  return { k: 'uas', t0: TL.hit + 0.5 };
+}
+
+/* ---------- drawing ---------- */
+const cv = document.getElementById('c'), g = cv.getContext('2d');
+let K = 1, OX = 0, OY = 0, BG = null, NZ = null;
+function size() {
+  const D = Math.min(2, Math.max(1.25, window.devicePixelRatio || 1)), w = Math.round(innerWidth * D), h = Math.round(innerHeight * D);
+  if (cv.width !== w || cv.height !== h) { cv.width = w; cv.height = h; BG = null; }
+  K = Math.min(cv.width / 1920, cv.height / 1080); OX = (cv.width - 1920 * K) / 2; OY = (cv.height - 1080 * K) / 2;
+}
+function background() {
+  const o = document.createElement('canvas'); o.width = cv.width; o.height = cv.height; const c = o.getContext('2d');
+  c.fillStyle = '#04131F'; c.fillRect(0, 0, o.width, o.height); c.setTransform(K, 0, 0, K, OX, OY);
+  const gr = c.createRadialGradient(1080, 560, 60, 1040, 560, 1250); gr.addColorStop(0, '#0B3556'); gr.addColorStop(0.5, '#071E33'); gr.addColorStop(1, '#04131F');
+  c.fillStyle = gr; c.fillRect(0, 0, 1920, 1080);
+  const r = rng(29); for (let i = 0; i < 700; i++) { c.fillStyle = rgba(C.steel, 0.02 + r() * 0.05); c.fillRect(r() * 1920, r() * 1080, 1.6, 1.6); }
+  return o;
+}
+function noiseTile() { const o = document.createElement('canvas'); o.width = 256; o.height = 160; const c = o.getContext('2d'), im = c.createImageData(256, 160), r = rng(77);
+  for (let i = 0; i < im.data.length; i += 4) { const v = r() * 255 | 0; im.data[i] = im.data[i + 1] = im.data[i + 2] = v; im.data[i + 3] = 255; }
+  c.putImageData(im, 0, 0); return o; }
+const path = p => { g.beginPath(); g.moveTo(p[0][0], p[0][1]); for (let i = 1; i < p.length; i++) g.lineTo(p[i][0], p[i][1]); };
+function line3(c, pts, close) { let started = false; g.beginPath();
+  for (const p of pts) { const s = P2(c, p); if (!s) { started = false; continue; } if (!started) { g.moveTo(s[0], s[1]); started = true; } else g.lineTo(s[0], s[1]); }
+  if (close) g.closePath(); }
+function rr(x, y, w, h, r) { g.beginPath(); g.moveTo(x + r, y); g.arcTo(x + w, y, x + w, y + h, r); g.arcTo(x + w, y + h, x, y + h, r); g.arcTo(x, y + h, x, y, r); g.arcTo(x, y, x + w, y, r); g.closePath(); }
+function glow(p, r, color, a) { if (a <= 0.005 || r <= 0) return; const gr = g.createRadialGradient(p[0], p[1], 0, p[0], p[1], r); gr.addColorStop(0, rgba(color, a)); gr.addColorStop(1, rgba(color, 0)); g.fillStyle = gr; g.fillRect(p[0] - r, p[1] - r, 2 * r, 2 * r); }
+function label(s, x, y, size, color, align, alpha, sp) {
+  if (alpha != null && alpha <= 0.01) return;
+  g.globalAlpha = alpha == null ? 1 : alpha; g.font = '700 ' + size + 'px ' + FONT; g.textAlign = align || 'center'; g.textBaseline = 'middle';
+  g.letterSpacing = (sp == null ? 2 : sp) + 'px'; g.lineJoin = 'round'; g.lineWidth = Math.max(4, size * 0.36); g.strokeStyle = 'rgba(4,19,31,0.92)';
+  g.strokeText(s, x, y); g.fillStyle = color; g.fillText(s, x, y); g.letterSpacing = '0px'; g.globalAlpha = 1;
+}
+function brackets(p, s, color, lw, alpha) {
+  if (alpha != null && alpha <= 0.01) return;
+  g.globalAlpha = alpha == null ? 1 : alpha; g.strokeStyle = color; g.lineWidth = lw || 2; const l = s * 0.42;
+  [[-1, -1], [1, -1], [-1, 1], [1, 1]].forEach(([a, b]) => { g.beginPath(); g.moveTo(p[0] + a * s, p[1] + b * (s - l)); g.lineTo(p[0] + a * s, p[1] + b * s); g.lineTo(p[0] + a * (s - l), p[1] + b * s); g.stroke(); });
+  g.globalAlpha = 1;
+}
+
+// solids: collect visible faces, sort far to near, paint. A group (G) keeps one object's faces together in the order:
+// the group's own depth first, then each face's.
+function emit(L, c, mesh, M, m, mode, tone, bias, G) {
+  const W = M ? mesh.v.map(p => ap(M, p)) : mesh.v;
+  for (const fc of mesh.f) {
+    const a = W[fc[0]], b = W[fc[1]], d = W[fc[2]], n = vn(vx(vs(b, a), vs(d, a)));
+    let x = 0, y = 0, z = 0; for (const k of fc) { x += W[k][0]; y += W[k][1]; z += W[k][2]; } x /= fc.length; y /= fc.length; z /= fc.length;
+    if ((c.eye[0] - x) * n[0] + (c.eye[1] - y) * n[1] + (c.eye[2] - z) * n[2] <= 0) continue;
+    const sp = projPoly(c, fc.map(k => W[k])); if (!sp) continue;
+    const fd = toC(c, [x, y, z])[2];
+    L.push({ d: G ? G.d : fd - (bias || 0), d2: fd, p: sp, fill: shade(m, n, mode, tone), edge: mode === 'main' ? m.edge : null });
+  }
+}
+const grp = (c, P, bias) => ({ d: toC(c, P)[2] - (bias || 0) });
+function paint(L, mode) {
+  L.sort((p, q) => (q.d - p.d) || (q.d2 - p.d2)); g.lineJoin = 'round';
+  for (const F of L) { path(F.p); g.closePath(); g.fillStyle = F.fill; g.fill();
+    if (F.edge) { g.strokeStyle = F.edge; g.lineWidth = 1; g.stroke(); } else if (mode === 'ir') { g.strokeStyle = F.fill; g.lineWidth = 0.6; g.stroke(); } }
+}
+let ANT = [];                                                            // antennas, drawn as lines after the solids
+function emitVehicle(L, c, V, t, mode, skipStation) {
+  const s = vstate(V, t), M0 = vmat(s);
+  for (const P of V.parts) emit(L, c, P.m, M0, MAT[P.mat], mode);
+  if (V === BRD) TUBES.forEach((p, i) => { const a = i === 0 ? 1.95 * eo((t - TL.pod) / 0.3) : 0;    // the first tube's lid flips open on its hinge
+    emit(L, c, LID, a > 0 ? mul(M0, MT(p[0] + 0.28, p[1], 2.82), MP(-a), MT(-0.28, 0, 0)) : mul(M0, MT(p[0], p[1], 2.82)), MAT.pod, mode); });
+  if (skipStation) return;
+  const ff = ffAim(V, t), Ma = azM(ff), Me = elM(ff), G = grp(c, ap(Ma, [0, 0, 0.45]), 1.4);
+  const Mg = ff.fire ? mul(Me, MT(-0.035 * (0.5 + 0.5 * Math.sin(t * 57)), 0, 0)) : Me;          // the gun recoils while it fires
+  RCP.turn.forEach(P => emit(L, c, P.m, Ma, MAT[P.mat], mode, 1, 0, G));
+  RCP.gun.forEach(P => emit(L, c, P.m, Mg, MAT[P.mat], mode, 1, 0, G));
+  RCP.side.forEach(P => emit(L, c, P.m, Me, MAT[P.mat], mode, 1, 0, G));
+}
+function emitFigure(L, c, F, mode) {
+  const P = F.pose, root = mul(MT(F.p[0], F.p[1], F.p[2]), MZ(F.h), MS(FIG_S)), G = grp(c, ap(root, [0, 0, 0.9]), F.bias);
+  const cloth = MAT[F.cloth], gear = MAT[F.gear], E = (m, M, mat) => emit(L, c, m, M, mat, mode, 1, 0, G);
+  [1, -1].forEach((sd, k) => { const hip = [0, sd * 0.1, P.hz], r = ik2(hip, P.feet[k], 0.44, 0.42, P.kp ? P.kp[k] : [1, 0, 0.5]);
+    E(FB.thigh, mul(root, boneM(hip, vs(r.J, hip), [0, 1, 0])), cloth);
+    const Ms = mul(root, boneM(r.J, vs(r.E, r.J), [0, 1, 0])); E(FB.shin, Ms, cloth); E(FB.boot, Ms, gear); });
+  const Mt = mul(root, MT(0, 0, P.hz), MP(-P.lean));
+  E(FB.pelvis, mul(root, MT(0, 0, P.hz)), cloth); E(FB.torso, Mt, cloth); E(FB.neck, Mt, cloth);
+  if (F.us) { E(FB.plate, Mt, gear); if (F.radio) { E(FB.pack, Mt, gear); if (mode === 'main') ANT.push([ap(Mt, [-0.22, 0.08, 0.46]), ap(Mt, [-0.3, 0.08, 1.3])]); } }
+  else E(FB.rig, Mt, gear);
+  const Mh = mul(Mt, MT(0, 0, 0.56), MZ(F.hy || 0), MP(F.hp || 0));
+  if (F.us) { E(FB.head, Mh, cloth); FB.helmet.forEach(m => E(m, Mh, gear)); } else E(FB.hood, Mh, cloth);
+  const W = WPN[F.wpn], Mw = axisM(P.w.o, P.w.d);                     // the weapon, then the arms reaching its grips
+  W.parts.forEach(m => E(m, mul(Mt, Mw), MAT.arms));
+  [[1, W.fore], [-1, W.grip]].forEach(([sd, hp]) => { const S = [0, sd * 0.2, 0.47], r = ik2(S, ap(Mw, hp), 0.29, 0.27, [0.25, sd * 0.85, -0.6]);
+    E(FB.upArm, mul(Mt, boneM(S, vs(r.J, S), [0, 1, 0])), cloth); E(FB.foreArm, mul(Mt, boneM(r.J, vs(r.E, r.J), [0, 1, 0])), cloth); });
+}
+// who is where, in what pose, at time t
+function people(t) {
+  const o = [], cw = env(t, TL.handoff + 0.6, TL.hit + 0.9, 0.5, 0.7), D6 = dpos(5, Math.min(t, TL.hit));
+  SQUAD.forEach((s, i) => { let hy = 0.32 * Math.sin(0.5 * t + i * 1.7), hp = 0;
+    if (cw > 0) { const d = vs(D6, s.p), yaw = ((Math.atan2(d[1], d[0]) - s.h + Math.PI * 3) % TAU) - Math.PI;
+      hy = lerp(hy, clamp(yaw, -1.3, 1.3), cw); hp = lerp(0, clamp(Math.atan2(d[2], Math.hypot(d[0], d[1])), 0, 0.8), cw); }
+    o.push({ p: s.p, h: s.h, pose: blendPose(POSE[s.pose], POSE.cover, cw), us: true, radio: s.radio, wpn: 'rifle', cloth: 'usCloth', gear: 'usGear', hy, hp, bias: 1.5 }); });
+  const up = 0.5 * env(t, TL.swarm - 0.2, TL.swarm + 5, 0.5, 1.0);
+  const fo = (i, pose, h, wpn, roof, hy, hp) => { const lit = t >= DET[i];
+    o.push({ p: hosAt(i, t), h, pose, wpn, cloth: lit ? 'foeClothLit' : 'foeCloth', gear: lit ? 'foeGearLit' : 'foeGear', hy, hp, bias: roof ? 9 : 1.5 }); };
+  const cr = k => { const d = vs(CRATE[k], HOS[[4, 3][k]]); return Math.atan2(d[1], d[0]); };
+  fo(0, walkPose(2.52 * t), Math.PI / 2, 'ak', false, 0.25 * Math.sin(0.7 * t), 0);
+  fo(1, POSE.rpg, -2.6, 'rpg', true, 0, 0);
+  fo(2, POSE.stand, -2.9, 'ak', true, 0.4 * Math.sin(0.45 * t + 1), 0);
+  fo(3, POSE.op, cr(1), 'ctrl', true, 0, up);
+  fo(4, POSE.op, cr(0), 'ctrl', false, 0, up);
+  return o;
+}
+function emitPeople(L, c, t, mode) { people(t).forEach(F => emitFigure(L, c, F, mode)); }
+function emitCrates(L, c, mode) { CRATE.forEach((p, k) => emit(L, c, CRM, mul(MT(p[0], p[1], p[2]), MZ(k ? 0.4 : -0.3), MS(FIG_S)), MAT.crate, mode, 1, 0, grp(c, va(p, [0, 0, 0.5]), k ? 9 : 1.5))); }
+function emitTown(L, c, mode) { BM.forEach(b => emit(L, c, b.m, null, MAT.bld, mode, b.tone)); ROOF.forEach(r => emit(L, c, r, null, MAT.roof, mode)); }
+function emitUAS(L, c, U, mode) { const M = mul(MT(U.p[0], U.p[1], U.p[2]), MZ(U.h), MX(U.roll), MS(1.6)); UASP.forEach(m => emit(L, c, m, M, MAT.uas, mode)); }
+function antennas(c) { g.strokeStyle = 'rgba(163,192,214,0.55)'; g.lineWidth = 1.2; ANT.forEach(([a, b]) => { const s = projSeg(c, a, b); if (s) { g.beginPath(); g.moveTo(s[0][0], s[0][1]); g.lineTo(s[1][0], s[1][1]); g.stroke(); } }); }
+
+// the drones: 3D quadcopters with spinning rotors when near, a symbol when far
+const droneM = (P, Q) => mul(MT(P[0], P[1], P[2]), MZ(Math.atan2(Q[1] - P[1], Q[0] - P[0])), MP(-0.28), MS(DSC));
+function droneBig(c, P) { const s = P2(c, P); return !!s && c.F * DSC * 0.9 / s[2] > 24; }
+function emitDrone(L, c, i, t, mode) { const P = dpos(i, t), M = droneM(P, dpos(i, t + 0.05)); QM.forEach(m => emit(L, c, m, M, MAT.drone, mode, 1, 0, grp(c, P, 0))); return M; }
+function rotors(c, M, t, mode) {
+  [[1, 1], [1, -1], [-1, 1], [-1, -1]].forEach(([a, b], k) => { const x0 = a * 0.354, y0 = b * 0.354, pts = [];
+    for (let i = 0; i < 14; i++) { const th = i / 14 * TAU, s = P2(c, ap(M, [x0 + 0.21 * Math.cos(th), y0 + 0.21 * Math.sin(th), 0.04])); if (s) pts.push(s); }
+    if (pts.length < 3) return; path(pts); g.closePath(); g.fillStyle = mode === 'ir' ? 'rgba(255,255,255,0.2)' : 'rgba(255,214,206,0.16)'; g.fill();
+    const an = t * 47 + k * 1.3, e0 = P2(c, ap(M, [x0 + 0.21 * Math.cos(an), y0 + 0.21 * Math.sin(an), 0.05])), e1 = P2(c, ap(M, [x0 - 0.21 * Math.cos(an), y0 - 0.21 * Math.sin(an), 0.05]));
+    if (e0 && e1) { g.strokeStyle = mode === 'ir' ? 'rgba(255,255,255,0.65)' : 'rgba(255,224,218,0.6)'; g.lineWidth = 1.4; g.beginPath(); g.moveTo(e0[0], e0[1]); g.lineTo(e1[0], e1[1]); g.stroke(); } });
+}
+// a quadcopter, drawn as a symbol facing the screen
+function quad(p, s, h, color, alpha) {
+  g.save(); g.translate(p[0], p[1]); g.rotate(h + Math.PI / 4); g.globalAlpha = alpha == null ? 1 : alpha;
+  g.strokeStyle = color; g.lineWidth = Math.max(1.3, s * 0.24);
+  g.beginPath(); g.moveTo(-s, -s); g.lineTo(s, s); g.moveTo(-s, s); g.lineTo(s, -s); g.stroke();
+  g.lineWidth = Math.max(1, s * 0.16); [[-s, -s], [s, -s], [-s, s], [s, s]].forEach(([x, y]) => { g.beginPath(); g.arc(x, y, s * 0.52, 0, TAU); g.stroke(); });
+  g.fillStyle = color; g.beginPath(); g.arc(0, 0, s * 0.4, 0, TAU); g.fill(); g.restore(); g.globalAlpha = 1;
+}
+function dart(p, h, s, color) { g.save(); g.translate(p[0], p[1]); g.rotate(h); g.fillStyle = color; g.beginPath(); g.moveTo(s * 1.5, 0); g.lineTo(-s, -s * 0.8); g.lineTo(-s * 0.45, 0); g.lineTo(-s, s * 0.8); g.closePath(); g.fill(); g.restore(); }
+const sAng = (c, a, b) => { const p = P2(c, a), q = P2(c, b); return p && q ? Math.atan2(q[1] - p[1], q[0] - p[0]) : 0; };
+
+// EdgeGuide drawn: its skin as a solid in the scene; when see-through, the AI core and the seeker glow inside, wired together
+function egParts(S) {
+  const M = S.M, f = (1 - S.wing) * Math.PI / 2, o = EGB.map(m => [m, M, MAT.eg]);
+  o.push([EGW, M, MAT.egGlass],
+    [EGWING.fl, mul(M, MT(0.3, 0.12, 0.15), MZ(f)), MAT.eg], [EGWING.fr, mul(M, MT(0.3, -0.12, 0.15), MZ(-f)), MAT.eg],       // folded back
+    [EGWING.rl, mul(M, MT(-0.62, 0.12, -0.15), MZ(-f)), MAT.eg], [EGWING.rr, mul(M, MT(-0.62, -0.12, -0.15), MZ(f)), MAT.eg]);   // folded forward
+  return o;
+}
+function egNear(c, S) { const s = P2(c, S.P); return !!s && c.F * 2.4 * EGSC / s[2] > 34; }
+function emitEG(L, c, S, mode, G) { egParts(S).forEach(([m, M, mat]) => emit(L, c, m, M, mat, mode, 1, 0, G)); }
+function drawEGXray(c, S, t) {
+  const xa = S.xr, LI = [], LS = [];
+  EGIN.forEach(([m, k]) => emit(LI, c, m, S.M, MAT[k], 'main')); paint(LI, 'main');                 // the parts inside, then the skin over them
+  emitEG(LS, c, S, 'main'); LS.forEach(F => { F.fill = F.fill.replace('rgb(', 'rgba(').replace(')', ',' + (1 - 0.74 * xa).toFixed(3) + ')'); }); paint(LS, 'main');
+  const cp = P2(c, ap(S.M, [0.17, 0, 0])), sp = P2(c, ap(S.M, [1.04, 0, 0])); if (!cp || !sp) return;
+  g.save(); g.globalCompositeOperation = 'lighter'; glow(cp, clamp(c.F * 0.5 / cp[2], 12, 70), C.cyan, 0.6 * xa); glow(sp, clamp(c.F * 0.28 / sp[2], 8, 40), C.cyan, 0.5 * xa); g.restore();
+  g.globalAlpha = xa; g.setLineDash([5, 5]); g.lineDashOffset = -t * 30; g.strokeStyle = C.white; g.lineWidth = 1.8;
+  g.beginPath(); g.moveTo(cp[0], cp[1]); g.lineTo(sp[0], sp[1]); g.stroke(); g.setLineDash([]); g.lineDashOffset = 0; g.globalAlpha = 1;
+}
+function egProp(c, S, t) {                                                 // the pusher prop: a blur disc and one blade
+  if (S.prop <= 0.01) return; const pts = [];
+  for (let i = 0; i < 16; i++) { const th = i / 16 * TAU, s = P2(c, ap(S.M, [-1.17, 0.3 * Math.cos(th), 0.3 * Math.sin(th)])); if (s) pts.push(s); }
+  if (pts.length > 2) { path(pts); g.closePath(); g.fillStyle = rgba(C.text2, 0.16 * S.prop); g.fill(); }
+  const an = t * 53, e0 = P2(c, ap(S.M, [-1.17, 0.3 * Math.cos(an), 0.3 * Math.sin(an)])), e1 = P2(c, ap(S.M, [-1.17, -0.3 * Math.cos(an), -0.3 * Math.sin(an)]));
+  if (e0 && e1) { g.strokeStyle = rgba(C.text2, 0.6 * S.prop); g.lineWidth = 2; g.beginPath(); g.moveTo(e0[0], e0[1]); g.lineTo(e1[0], e1[1]); g.stroke(); }
+}
+function launchPuff(c, t) {                                               // the cold launch: a flash and a puff of gas off the tube
+  const u = t - TL.launch; if (u < -0.02 || u > 1.8) return;
+  const P0 = tube0(), s0 = P2(c, P0); if (!s0) return; const r = rng(91);
+  if (u < 0.2) glow(s0, clamp(c.F * 1.3 / s0[2], 10, 220), '#FFFFFF', 0.9 * (1 - u / 0.2));
+  for (let i = 0; i < 7; i++) { const a = r() * TAU, sp = 0.6 + r() * 1.4, w = Math.max(0, u - i * 0.03), lift = 0.4 + r() * 0.6;
+    const s = P2(c, va(P0, [Math.cos(a) * sp * eo(w / 1.2), Math.sin(a) * sp * eo(w / 1.2), lift + 1.6 * eo(w / 1.4)])); if (!s) continue;
+    glow(s, clamp(c.F * (0.35 + 1.0 * eo(w / 1.4)) / s[2], 3, 200), C.text2, 0.3 * (1 - u / 1.8)); }
+}
+
+// a kill: flash, ring, debris falling to the ground, a little smoke
+function boom(c, P, dt, seed, mode) {
+  if (dt < 0 || dt > 2.2) return;
+  const s = P2(c, P); if (!s) return;
+  const k = clamp(c.F * 0.12 / s[2], 0.3, mode === 'ir' ? 2.5 : 3.2), col = mode === 'ir' ? '#FFFFFF' : C.fire, r = rng(seed);
+  glow(s, (16 + 46 * eo(Math.min(1, dt / 0.3))) * k, col, 0.95 * Math.pow(1 - Math.min(1, dt / 0.8), 2));
+  if (dt < 0.9) { g.strokeStyle = rgba(col, 0.75 * (1 - dt / 0.9)); g.lineWidth = 2; g.beginPath(); g.arc(s[0], s[1], (8 + 56 * eo(dt / 0.9)) * k, 0, TAU); g.stroke(); }
+  for (let i = 0; i < 3; i++) { const q = P2(c, va(P, [r() * 3 - 1.5, r() * 3 - 1.5, 2.5 * dt])); if (!q) continue;
+    glow(q, (10 + 26 * eo(dt / 2.2)) * k, mode === 'ir' ? '#E2E2DC' : C.steel, 0.22 * (1 - dt / 2.2)); }
+  for (let i = 0; i < 14; i++) {
+    const th = r() * TAU, sp = 5 + r() * 9, vz = 2 + r() * 8, e = (1 - Math.exp(-1.6 * dt)) / 1.6;
+    const q = P2(c, [P[0] + Math.cos(th) * sp * e, P[1] + Math.sin(th) * sp * e, Math.max(0.1, P[2] + vz * dt - 7 * dt * dt)]); if (!q) continue;
+    const u = dt / 2.2; g.fillStyle = mode === 'ir' ? 'rgba(255,255,255,' + (1 - u) + ')' : rgba(u < 0.3 ? C.fire : u < 0.6 ? C.red : C.steel, 1 - u);
+    const z = Math.max(1.6, 2.6 * k * 0.6); g.fillRect(q[0] - z / 2, q[1] - z / 2, z, z);
+  }
+}
+function tracers(c, ff, i, t, mode) {                                     // ForceField bursts at drone i: muzzle flash per round, tracers
+  const d = DR[i]; if (t < d.kill - 0.75 || t > d.kill + 0.04) return;
+  const Me = elM(ff), m = ap(Me, MUZ), s0 = P2(c, m), col = mode === 'ir' ? '#FFFFFF' : C.fire;
+  if (s0) { const k = clamp(c.F * 0.12 / s0[2], 0.6, 6), rd = (t - d.kill + 0.75) / 0.07, on = rd % 1 < 0.42;
+    if (on) { const s1 = P2(c, ap(Me, [MUZ[0] + 0.5, 0, MUZ[2]])); if (s1) {           // the flash: a forward tongue, two side spikes, a white core
+      const dx = s1[0] - s0[0], dy = s1[1] - s0[1], L = (Math.hypot(dx, dy) || 1) * (0.8 + 0.4 * rng((rd | 0) + i * 13)()), ux = dx / (Math.hypot(dx, dy) || 1), uy = dy / (Math.hypot(dx, dy) || 1);
+      const spike = (an, len, wd) => { const ax = ux * Math.cos(an) - uy * Math.sin(an), ay = ux * Math.sin(an) + uy * Math.cos(an);
+        g.beginPath(); g.moveTo(s0[0] - ay * wd, s0[1] + ax * wd); g.lineTo(s0[0] + ax * len, s0[1] + ay * len); g.lineTo(s0[0] + ay * wd, s0[1] - ax * wd); g.closePath(); g.fill(); };
+      g.fillStyle = mode === 'ir' ? '#FFFFFF' : rgba(C.fire, 0.88); spike(0, L, L * 0.13); spike(0.75, L * 0.42, L * 0.07); spike(-0.75, L * 0.42, L * 0.07);
+      g.fillStyle = 'rgba(255,255,255,0.95)'; spike(0, L * 0.45, L * 0.06); } }
+    glow(s0, 9 * k, col, on ? 0.95 : 0.3); }
+  for (let e = d.kill - 0.75; e <= d.kill; e += 0.07) { const u = (t - e) / 0.13; if (u < 0 || u > 1) continue;
+    const tp = dpos(i, Math.min(d.kill, e + 0.13)), s = projSeg(c, vlp(m, tp, Math.max(0, u - 0.35)), vlp(m, tp, u)); if (!s) continue;
+    g.beginPath(); g.moveTo(s[0][0], s[0][1]); g.lineTo(s[1][0], s[1][1]);
+    if (mode !== 'ir') { g.strokeStyle = rgba(C.fire, 0.35); g.lineWidth = 7; g.stroke(); }
+    g.strokeStyle = col; g.lineWidth = mode === 'ir' ? 1.6 : 2.6; g.stroke(); }
+}
+function brass(c, ff, i, t) {                                             // spent cases thrown out of the receiver, falling (close views)
+  const d = DR[i]; if (t < d.kill - 0.75 || t > d.kill + 0.75) return;
+  const Me = elM(ff), ej = ap(Me, EJECT), s0 = P2(c, ej); if (!s0 || c.F * 0.12 / s0[2] < 1.4) return;
+  const side = vs(ap(Me, [0, -1, 0]), ap(Me, [0, 0, 0])), sn = vn(side);
+  for (let e = d.kill - 0.75; e <= d.kill; e += 0.07) { const u = t - e; if (u < 0 || u > 0.7) continue;
+    const r = rng(((e * 100) | 0) + i * 7)(), v = va(vk(sn, 2.4 + 1.6 * r), [0, 0, 1.4 + r]), P = va(va(ej, vk(v, u)), [0, 0, -4.9 * u * u]);
+    const s = P2(c, P); if (!s) continue; g.fillStyle = rgba(C.fire, 0.95 * (1 - u / 0.7)); g.fillRect(s[0] - 2, s[1] - 1.2, 4, 2.4); }
+}
+function smoke(c, ff, i, t) {                                             // gun smoke drifting off the muzzle after a burst
+  const d = DR[i], u = t - (d.kill - 0.75); if (u < 0 || u > 2.6) return;
+  const m = muzzle(ff); for (let k = 0; k < 4; k++) { const w = u - k * 0.16; if (w < 0) continue;
+    const s = P2(c, va(m, [0.3 * k, 0.2 * k, 0.7 * w])); if (!s) continue;
+    glow(s, clamp(c.F * (0.3 + 0.55 * w) / s[2], 3, 90), C.steel, 0.14 * (1 - w / 2.6)); }
+}
+function sightCone(c, V, t, a) {                                          // ForceField's sight: what the AI watches, then what it locks
+  if (a <= 0.01) return;
+  const ff = ffAim(V, t), o = lensP(ff), d = aimDir(ff), lock = ff.tgt >= 0, len = lock ? vl(vs(dpos(ff.tgt, t), o)) + 2 : 30, hw = (lock ? 0.05 : 0.1) * len;
+  const r = vn(vx(d, [0, 0, 1])), u = vx(r, d), E = va(o, vk(d, len));
+  const so = P2(c, o), sc = [[1, 1], [-1, 1], [-1, -1], [1, -1]].map(([x, y]) => P2(c, va(E, va(vk(r, x * hw), vk(u, y * hw * 0.62)))));
+  if (!so || sc.some(s => !s)) return;
+  const mid = [(sc[0][0] + sc[2][0]) / 2, (sc[0][1] + sc[2][1]) / 2], gr = g.createLinearGradient(so[0], so[1], mid[0], mid[1]);
+  gr.addColorStop(0, rgba(C.cyan, 0.22 * a)); gr.addColorStop(1, rgba(C.cyan, 0)); path(hull(sc.concat([so]))); g.closePath(); g.fillStyle = gr; g.fill();
+  const ge = g.createLinearGradient(so[0], so[1], mid[0], mid[1]); ge.addColorStop(0, rgba(C.cyan, 0.6 * a)); ge.addColorStop(1, rgba(C.cyan, 0));
+  g.strokeStyle = ge; g.lineWidth = 1.2; sc.forEach(s => { g.beginPath(); g.moveTo(so[0], so[1]); g.lineTo(s[0], s[1]); g.stroke(); });
+}
+function ring3(c, p, r, color, a, lw, dash) { if (a <= 0.01) return; const pts = [];
+  for (let i = 0; i <= 56; i++) { const th = i / 56 * TAU; pts.push([p[0] + r * Math.cos(th), p[1] + r * Math.sin(th), p[2] || 0.05]); }
+  line3(c, pts, true); if (dash) g.setLineDash(dash); g.strokeStyle = rgba(color, a); g.lineWidth = lw || 2; g.stroke(); g.setLineDash([]); }
+function pulse(c, p, t0, t, color, rmax) { const u = (t - t0) / 1.0; if (u < 0 || u > 1) return; ring3(c, p, 2 + (rmax || 14) * eo(u), color, 0.85 * (1 - u), 2.2); }
+function link3(c, A3, B3, a, t, bright, e0, e1, lu) {                  // a datalink arc with packets running along it
+  if (a <= 0.01) return null;
+  const M = va(vk(va(A3, B3), 0.5), [0, 0, 10 + vl(vs(A3, B3)) * 0.08]), pts = [];
+  for (let i = 0; i <= 30; i++) pts.push(bz2(A3, M, B3, i / 30));
+  line3(c, pts); g.setLineDash([9, 8]); g.lineDashOffset = -t * 46; g.strokeStyle = rgba(C.cyan, (bright ? 0.95 : 0.6) * a); g.lineWidth = bright ? 2.8 : 1.8; g.stroke(); g.setLineDash([]); g.lineDashOffset = 0;
+  for (let e = e0; e <= e1; e += 0.22) { const u = (t - e) / 0.85; if (u < 0 || u > 1) continue; const s = P2(c, bz2(A3, M, B3, u)); if (!s) continue;
+    glow(s, 14, C.cyan, 0.7 * a); g.fillStyle = rgba(C.white, a); g.fillRect(s[0] - 3, s[1] - 3, 6, 6); }
+  return P2(c, bz2(A3, M, B3, lu == null ? 0.5 : lu));
+}
+
+/* ---------- the main view: the sand table, with a close-up on the tank's weapon station for its three kills ---------- */
+const VPM = { x: 0, y: 0, w: 1920, h: 1080 };
+const RCW = ap(rcwsBase(ABR, ABR_END), [0, 0, PIV]), KC3 = vk(va(va(KILL[0], KILL[1]), KILL[2]), 1 / 3);
+const ZC = { at: vlp(RCW, KC3, 0.25), az: 186 * D2R, el: 20 * D2R, R: 23, fov: 36 };     // from the west, over the station's shoulder
+const zoomW = t => sm((t - TL.zin) / (TL.ff - TL.zin)) * (1 - sm((t - TL.zout) / (TL.wide - TL.zout)));
+// the second close-up: the IFV's pod from its right side; then the camera rises with EdgeGuide and closes in on it,
+// looking down so the ground stays behind it, for the see-through moment
+const ZC2 = { az: 318 * D2R, el: 17 * D2R, R: 15, fov: 34 }, PODT = va(tube0(), [0, 0, 1.0]);
+const zoomW2 = t => sm((t - TL.zin2) / (TL.pod - TL.zin2)) * (1 - sm((t - TL.zout2) / (TL.wide2 - TL.zout2)));
+const chase = t => { const ip = ipos(t); return ip ? vlp(PODT, ip, sm((t - TL.launch) / 0.6)) : PODT; };
+const near2 = t => sm((t - TL.launch - 0.2) / 1.1);                       // 0 at the pod, 1 close on the drone, from above
+function mainCam(t) {
+  if (A.cam) return mkCam(A.cam.eye, A.cam.at, A.cam.fov || 30, VPM, 0, 0);
+  const u = sm(t / 8), v = sm((t - 8) / 30);                            // tracks the vehicles in, rises to the whole town, then drifts
+  let at = vlp([-8, -18, 0], [32, 30, 6], u), az = (lerp(232, 240, u) + 5 * v) * D2R, el = lerp(50, 38, u) * D2R, R = lerp(460, 290, u) - 10 * v, ox = 60, oy = 20, fov = 30;
+  const w = zoomW(t);
+  if (w > 0) { const h = sm((t - TL.ff) / (TL.zout - TL.ff));        // in close, a slow drift round the station
+    at = vlp(at, ZC.at, w); az = angLerp(az, ZC.az - 3 * D2R * h, w); el = lerp(el, ZC.el - 1.5 * D2R * h, w);
+    R = Math.exp(lerp(Math.log(R), Math.log(ZC.R - 2 * h), w)); ox = lerp(ox, 0, w); oy = lerp(oy, 0, w); fov = lerp(30, ZC.fov, w); }
+  const w2 = zoomW2(t);
+  if (w2 > 0) { const n2 = near2(t), R2 = lerp(ZC2.R, 10.5, n2), h2 = sm((t - TL.pod) / (TL.zout2 - TL.pod));
+    at = vlp(at, chase(t), sm(w2 / 0.6)); az = angLerp(az, ZC2.az + 4 * D2R * h2, w2); el = lerp(el, ZC2.el + 31 * D2R * n2, w2);   // it keeps the drone in view while pulling back
+    R = Math.exp(lerp(Math.log(R), Math.log(R2), w2)); ox = lerp(ox, 0, w2); oy = lerp(oy, 0, w2); fov = lerp(fov, ZC2.fov, w2); }
+  return mkCam([at[0] + R * Math.cos(el) * Math.cos(az), at[1] + R * Math.cos(el) * Math.sin(az), at[2] + R * Math.sin(el)], at, fov, VPM, ox, oy);
+}
+function table(c) {
+  const z1 = -TB.th, X0 = TB.x0, X1 = TB.x1, Y0 = TB.y0, Y1 = TB.y1;
+  const sides = [[[0, -1, 0], [[X0, Y0, 0], [X1, Y0, 0], [X1, Y0, z1], [X0, Y0, z1]]], [[1, 0, 0], [[X1, Y0, 0], [X1, Y1, 0], [X1, Y1, z1], [X1, Y0, z1]]],
+    [[0, 1, 0], [[X1, Y1, 0], [X0, Y1, 0], [X0, Y1, z1], [X1, Y1, z1]]], [[-1, 0, 0], [[X0, Y1, 0], [X0, Y0, 0], [X0, Y0, z1], [X0, Y1, z1]]]];
+  sides.forEach(([n, P]) => { if (vd(n, vs(c.eye, P[0])) <= 0) return; const s = projPoly(c, P); if (!s) return;
+    const gr = g.createLinearGradient(0, Math.min(s[0][1], s[1][1]), 0, Math.max(s[2][1], s[3][1])); gr.addColorStop(0, '#0B2A45'); gr.addColorStop(1, '#04131F');
+    path(s); g.closePath(); g.fillStyle = gr; g.fill(); });
+  const top = projPoly(c, [[X0, Y0, 0], [X1, Y0, 0], [X1, Y1, 0], [X0, Y1, 0]]); if (!top) return;
+  const ctr = P2(c, [40, 30, 0]) || [960, 540, 1], gr = g.createRadialGradient(ctr[0], ctr[1], 40, ctr[0], ctr[1], 900); gr.addColorStop(0, '#0B3556'); gr.addColorStop(1, '#061B2E');
+  path(top); g.closePath(); g.fillStyle = gr; g.fill();
+  g.save(); g.globalCompositeOperation = 'lighter'; path(top); g.closePath();
+  g.strokeStyle = rgba(C.cyan, 0.12); g.lineWidth = 9; g.stroke(); g.strokeStyle = rgba(C.cyan, 0.55); g.lineWidth = 1.6; g.stroke(); g.restore();
+}
+function groundMain(c, t) {
+  g.fillStyle = 'rgba(163,192,214,0.04)'; FIELDS.forEach(f => { const s = projPoly(c, f); if (s) { path(s); g.closePath(); g.fill(); } });
+  g.strokeStyle = 'rgba(163,192,214,0.09)'; g.lineWidth = 1.1; CONT.forEach(r => { line3(c, r, true); g.stroke(); });
+  g.strokeStyle = 'rgba(83,198,221,0.06)'; g.lineWidth = 1; GRID.forEach(([a, b]) => { const s = projSeg(c, a, b); if (s) { g.beginPath(); g.moveTo(s[0][0], s[0][1]); g.lineTo(s[1][0], s[1][1]); g.stroke(); } });
+  let s = projPoly(c, TOWNB); if (s) { path(s); g.closePath(); g.fillStyle = '#051726'; g.fill(); g.strokeStyle = 'rgba(163,192,214,0.12)'; g.lineWidth = 1; g.stroke(); }
+  s = projPoly(c, ROADP); if (s) { path(s); g.closePath(); g.fillStyle = '#0B2944'; g.fill(); g.strokeStyle = 'rgba(163,192,214,0.16)'; g.lineWidth = 1; g.stroke(); }
+  line3(c, ROAD.pts.map(p => [p[0], p[1], 0.04])); g.setLineDash([10, 12]); g.strokeStyle = 'rgba(163,192,214,0.22)'; g.lineWidth = 1.2; g.stroke(); g.setLineDash([]);
+  g.fillStyle = 'rgba(1,8,15,0.5)'; SHAD.forEach(P => { const q = projPoly(c, P); if (q) { path(q); g.closePath(); g.fill(); } });
+  [ABR, BRD].forEach(V => { const st = vstate(V, t), M = mul(MT(st.p[0] + SD[0] * 2.2, st.p[1] + SD[1] * 2.2, 0.04), MZ(st.h), MS(VS)),
+    q = projPoly(c, [[-4.2, -2.1, 0], [4.2, -2.1, 0], [4.2, 2.1, 0], [-4.2, 2.1, 0]].map(p => ap(M, p))); if (q) { path(q); g.closePath(); g.fillStyle = 'rgba(1,8,15,0.55)'; g.fill(); } });
+}
+function airShadow(c, P, a, r) { const s = P2(c, [P[0], P[1], 0.05]), q = P2(c, P); if (!s || !q) return;
+  g.globalAlpha = a; g.strokeStyle = 'rgba(163,192,214,0.25)'; g.lineWidth = 1; g.setLineDash([2, 4]); g.beginPath(); g.moveTo(q[0], q[1]); g.lineTo(s[0], s[1]); g.stroke(); g.setLineDash([]);
+  g.fillStyle = 'rgba(1,8,15,0.55)'; g.beginPath(); g.ellipse(s[0], s[1], r, r * 0.5, 0, 0, TAU); g.fill(); g.globalAlpha = 1; }
+
+function scene(t) {
+  const c = mainCam(t), w2 = zoomW2(t), w = Math.max(zoomW(t), w2), hf = 1 - w, U = uasAt(t), FP = footprint(t), abr = vstate(ABR, t), brd = vstate(BRD, t);
+  const ffA = ffAim(ABR, t), ffB = ffAim(BRD, t), IP = ipos(t), FFS = [[ABR, ffA], [BRD, ffB]];
+  const EGS = IP && t < TL.hit ? egState(t) : null, egBig = !!EGS && egNear(c, EGS);
+  table(c); groundMain(c, t);
+  // ground marks: the sensor footprint, detection pulses, receivers
+  if (U && FP && hf > 0.01) { const a = U.a * sm((t - TL.scan) / 0.6) * hf, P = [FP[0], FP[1], 0.1];
+    ring3(c, P, 17, C.cyan, 0.55 * a, 1.6, [6, 7]);
+    const q = []; for (let i = 0; i <= 40; i++) { const th = i / 40 * TAU; q.push([P[0] + 17 * Math.cos(th), P[1] + 17 * Math.sin(th), 0.1]); }
+    const sp = q.map(p => P2(c, p)).filter(Boolean); if (sp.length > 2) { path(sp); g.closePath(); g.fillStyle = rgba(C.cyan, 0.07 * a); g.fill(); }
+    const sw = (t * 0.9) % 1, yy = -17 + 34 * sw, hw = Math.sqrt(Math.max(0, 289 - yy * yy));
+    const s1 = projSeg(c, [P[0] - hw, P[1] + yy, 0.12], [P[0] + hw, P[1] + yy, 0.12]); if (s1) { g.strokeStyle = rgba(C.cyan, 0.5 * a); g.lineWidth = 1.5; g.beginPath(); g.moveTo(s1[0][0], s1[0][1]); g.lineTo(s1[1][0], s1[1][1]); g.stroke(); } }
+  HOS.forEach((h0, i) => { const h = hosAt(i, t); pulse(c, h, DET[i], t, C.red, 14); if (t >= DET[i]) ring3(c, h, 3.2, C.red, 0.75 * hf, 1.6); });
+  [abr.p, brd.p, SQC].forEach((p, i) => pulse(c, p, TL.share + 0.95 + i * 0.12, t, C.cyan, 20));
+  if (t >= TL.swarm) [L1, L2].forEach((p, i) => pulse(c, [p[0], p[1], p[2]], TL.swarm + 0.15 * i, t, C.red, 18));
+  // solids: the town, the vehicles and their stations, the people, the crates, the near drones
+  const L = [], big = []; ANT = [];
+  emitTown(L, c, 'main'); emitVehicle(L, c, ABR, t, 'main'); emitVehicle(L, c, BRD, t, 'main'); emitPeople(L, c, t, 'main'); emitCrates(L, c, 'main');
+  for (let i = 0; i < 6; i++) if (alive(i, t) && droneBig(c, dpos(i, t))) big.push([i, emitDrone(L, c, i, t, 'main')]);
+  if (egBig && EGS.xr < 0.02) emitEG(L, c, EGS, 'main', grp(c, EGS.P, 0));
+  paint(L, 'main'); big.forEach(b => rotors(c, b[1], t, 'main')); antennas(c); launchPuff(c, t);
+  // the air: the UAS, the swarm, the interceptor
+  if (U) { airShadow(c, U.p, 0.6 * U.a, 10); g.globalAlpha = U.a; const LU = []; emitUAS(LU, c, U, 'main'); paint(LU, 'main'); g.globalAlpha = 1; }
+  for (let i = 0; i < 6; i++) if (alive(i, t)) airShadow(c, dpos(i, t), 0.55, 4);
+  if (IP && t < TL.hit) airShadow(c, IP, 0.55, 4);
+  g.save(); g.globalCompositeOperation = 'lighter';
+  if (U && FP && hf > 0.01) { const a = U.a * sm((t - TL.scan) / 0.6) * hf, su = P2(c, U.p), ring = [];
+    for (let i = 0; i < 36; i++) { const th = i / 36 * TAU, s = P2(c, [FP[0] + 17 * Math.cos(th), FP[1] + 17 * Math.sin(th), 0.1]); if (s) ring.push(s); }
+    if (su && ring.length > 2) { const H = hull(ring.concat([su])), cg = ring.reduce((o, p) => [o[0] + p[0] / ring.length, o[1] + p[1] / ring.length], [0, 0]);
+      const gr = g.createLinearGradient(su[0], su[1], cg[0], cg[1]); gr.addColorStop(0, rgba(C.cyan, 0.2 * a)); gr.addColorStop(1, rgba(C.cyan, 0.05 * a)); path(H); g.closePath(); g.fillStyle = gr; g.fill(); } }
+  FFS.forEach(([V]) => sightCone(c, V, t, env(t, TL.swarm + 0.2, DR[V.targets[V.targets.length - 1]].kill + 0.9, 0.5, 0.6) * (V === ABR ? 1 : hf)));
+  let shareMid = null, handMid = null;
+  if (U) {
+    const sa = env(t, TL.share, TL.swarm + 0.6, 0.4, 0.8) * (1 - 0.55 * sm((t - TL.swarm + 0.4) / 0.8)) * hf;
+    [[...abr.p.slice(0, 2), 5], [...brd.p.slice(0, 2), 5], [SQC[0], SQC[1], 4]].forEach((q, i) => { const m = link3(c, U.p, q, sa, t, false, TL.share + 0.1 + i * 0.12, TL.share + 2.2); if (i === 0) shareMid = m; });
+    const ha = env(t, TL.handoff, TL.launch + 1.2, 0.3, 0.8);
+    handMid = link3(c, U.p, [brd.p[0], brd.p[1], 5], ha, t, true, TL.handoff + 0.1, TL.handoff + 0.9, 0.72);
+  }
+  // cue lines: the vehicles' own sights re-identify the shared tracks
+  const cueA = env(t, TL.share + 1.2, TL.swarm + 0.4, 0.5, 0.5);
+  if (cueA > 0) [ffA, ffB].forEach((ff, k) => { const tgt = HOS[[ABR, BRD][k].cue], s = projSeg(c, lensP(ff), va(tgt, [0, 0, 1.5])); if (!s) return;
+    g.setLineDash([3, 6]); g.strokeStyle = rgba(C.cyan, 0.55 * cueA); g.lineWidth = 1.3; g.beginPath(); g.moveTo(s[0][0], s[0][1]); g.lineTo(s[1][0], s[1][1]); g.stroke(); g.setLineDash([]); });
+  FFS.forEach(([V, ff]) => { if (ff.tgt >= 0) tracers(c, ff, ff.tgt, t, 'main'); V.targets.forEach(i => smoke(c, ff, i, t)); });
+  for (let i = 0; i < 6; i++) boom(c, KILL[i], t - DR[i].kill, 40 + i, 'main');
+  g.restore();
+  FFS.forEach(([V, ff]) => V.targets.forEach(i => brass(c, ff, i, t)));
+  // the far drones as symbols, the interceptor, on top
+  for (let i = 0; i < 6; i++) { if (!alive(i, t)) continue;
+    for (let k = 9; k >= 1; k--) { const q = P2(c, dpos(i, Math.max(DR[i].tl, t - k * 0.08))); if (q) { g.fillStyle = rgba(C.red, 0.5 * (1 - k / 10)); g.beginPath(); g.arc(q[0], q[1], 2.6, 0, TAU); g.fill(); } }
+    const p = P2(c, dpos(i, t)); if (!p) continue;
+    if (big.some(b => b[0] === i)) { glow(p, clamp(c.F * 0.2 / p[2], 24, 80), C.red, 0.22); continue; }
+    const h = sAng(c, dpos(i, t), dpos(i, t + 0.05)), z = clamp(c.F * 0.045 / p[2], 8, 14);
+    glow(p, 30, C.red, 0.45); quad(p, z, h, C.red, 1); }
+  if (IP && t < TL.hit && !egBig) { for (let k = 9; k >= 1; k--) { const q = P2(c, ipos(Math.max(TL.launch, t - k * 0.07))); if (q) { g.fillStyle = rgba(C.cyan, 0.45 * (1 - k / 10)); g.beginPath(); g.arc(q[0], q[1], 2.2, 0, TAU); g.fill(); } }
+    const p = P2(c, IP); if (p) { glow(p, 26, C.cyan, 0.55); dart(p, sAng(c, IP, ipos(t + 0.05)), 9, C.white); } }
+  if (egBig) { if (EGS.xr >= 0.02) drawEGXray(c, EGS, t); egProp(c, EGS, t); }
+  if (w > 0.01) { const vg = g.createRadialGradient(330, 210, 40, 330, 210, 780);     // in close, a veil keeps the title calm
+    vg.addColorStop(0, 'rgba(4,19,31,' + (0.8 * w) + ')'); vg.addColorStop(0.55, 'rgba(4,19,31,' + (0.45 * w) + ')'); vg.addColorStop(1, 'rgba(4,19,31,0)');
+    g.fillStyle = vg; g.fillRect(0, 0, 1110, 990); }
+  hud(c, t, U, abr, brd, ffA, ffB, IP, shareMid, handMid, w, EGS, egBig ? w2 : 0);
+}
+
+function vtag(a, anchor, title, sub, dx, dy) {                          // a leader line from a vehicle up to its name
+  if (a <= 0.01 || !anchor) return;
+  const x = anchor[0] + dx, y = anchor[1] + dy;
+  if (y < 24 || y + 40 > 975 || x < 40 || x > 1880 || (x < 1040 && y < 340)) return;   // never under the bar, off the slide or on the title, even mid-move
+  g.globalAlpha = a; g.strokeStyle = rgba(C.cyan, 0.75); g.lineWidth = 1.4; g.beginPath(); g.moveTo(anchor[0], anchor[1]); g.lineTo(x, y + 18); g.lineTo(x + (dx < 0 ? -10 : 10), y + 18); g.stroke();
+  g.fillStyle = C.cyan; g.beginPath(); g.arc(anchor[0], anchor[1], 3.2, 0, TAU); g.fill(); g.globalAlpha = 1;
+  const al = dx < 0 ? 'right' : 'left', tx = x + (dx < 0 ? -16 : 16);
+  label(title, tx, y + 4, 17, C.white, al, a, 2); label(sub, tx, y + 28, 13, C.cyan, al, a, 2);
+}
+function hud(c, t, U, abr, brd, ffA, ffB, IP, shareMid, handMid, w, EGS, w2) {
+  const hf = sm((0.45 - w) / 0.45), va0 = sm((t - 1.4) / 0.8) * hf;    // the wide view's labels wait until the camera is nearly out
+  vtag(va0, P2(c, ap(vmat(abr), [0, 0, 3.4])), LB.abrams, LB.abramsSub, -70, -118);
+  vtag(va0, P2(c, ap(vmat(brd), [0, 0, 3.3])), LB.bradley, LB.bradleySub, -84, -64);
+  const sq = P2(c, [SQC[0], SQC[1], 6]); if (sq) label(LB.squad, sq[0], sq[1] - 22, 14, C.cyan, 'center', sm((t - 2.2) / 0.8) * hf);
+  if (U) { const p = P2(c, U.p); if (p) label(LB.uas, p[0], p[1] - 34, 15, C.cyan, 'center', hf * U.a * Math.max(1 - sm((t - TL.swarm + 0.4) / 0.4), sm((t - TL.end - 0.4) / 0.6))); }
+  if (hf > 0.01) HOS.forEach((h0, i) => {                                // each track: a bracket, a 3D pin, its ID
+    if (t < DET[i]) return;
+    const h = hosAt(i, t), age = t - DET[i], b = P2(c, va(h, [0, 0, 2])), top = P2(c, va(h, [0, 0, 13])); if (!b || !top) return;
+    brackets(b, lerp(38, 15, eo(age / 0.45)), C.red, 2, 0.95 * hf);
+    g.globalAlpha = hf; g.strokeStyle = rgba(C.red, 0.7); g.lineWidth = 1.2; g.beginPath(); g.moveTo(b[0], b[1] - 12); g.lineTo(top[0], top[1]); g.stroke();
+    g.save(); g.translate(top[0], top[1]); g.rotate(Math.PI / 4); g.fillStyle = C.red; g.fillRect(-5, -5, 10, 10); g.restore();
+    label(LB.hostile, top[0], top[1] - 20, 12, C.red, 'center', (1 - sm((age - 1.2) / 0.4)) * hf);
+    if (t >= TL.share + 1.0) { g.globalAlpha = hf; g.setLineDash([3, 4]); g.strokeStyle = rgba(C.cyan, 0.8 * sm((t - TL.share - 1.0) / 0.5)); g.lineWidth = 1.5;
+      g.beginPath(); g.arc(b[0], b[1], 21, t * 0.9, t * 0.9 + 5.2); g.stroke(); g.setLineDash([]); }
+    g.globalAlpha = 1;
+  });
+  if (shareMid) label(LB.sharing, shareMid[0], shareMid[1] - 18, 14, C.cyan, 'center', env(t, TL.share + 0.3, TL.swarm - 0.2, 0.4, 0.5));
+  const ra = env(t, TL.share + 1.0, TL.swarm - 0.1, 0.3, 0.5);
+  if (t >= TL.swarm) { const s = P2(c, va(L1, [0, 0, 6])), q = P2(c, va(L2, [0, 0, 6])), a = env(t, TL.swarm, TL.swarm + 2.6, 0.3, 0.5) * hf;
+    if (s) label(LB.swarm, s[0], s[1] - 26, 15, C.red, 'center', a); if (q) label(LB.swarm, q[0], q[1] - 26, 15, C.red, 'center', a); }
+  [ffA, ffB].forEach(ff => { if (ff.tgt < 0) return; const d = DR[ff.tgt], p = P2(c, dpos(ff.tgt, t)); if (!p) return;
+    brackets(p, lerp(30, 15, eo((t - d.kill + 1.5) / 0.35)) * (1 + 0.6 * w), C.cyan, 2); });
+  // the close-up: the station's name, and each drone's ID and state as the sight holds it
+  const ca = w * sm((t - TL.ff + 0.5) / 0.6) * (1 - sm((t - TL.zout + 0.3) / 0.4));
+  if (ca > 0.01) { vtag(ca, P2(c, lensP(ffA)), LB.ffTitle, LB.ffSub, 150, 40);
+    if (ffA.tgt >= 0) { const p = P2(c, dpos(ffA.tgt, t)); if (p) label('D' + (ffA.tgt + 1) + ' · ' + (ffA.fire ? LB.engage : LB.track), p[0] + 34, p[1] - 30, 15, C.cyan, 'left', ca, 1); } }
+  if (t >= TL.handoff - 0.8 && t < TL.hit) { const p = P2(c, dpos(5, t)); if (p) { brackets(p, t >= TL.lock ? lerp(34, 16, eo((t - TL.lock) / 0.5)) : 20, t >= TL.lock ? C.cyan : C.steel, t >= TL.lock ? 2.6 : 1.6, 0.95);
+    label('D6', p[0] + 26, p[1] + 2, 14, t >= TL.lock ? C.cyan : C.steel, 'left', 1, 1);
+    if (t >= TL.lock) label(LB.lock, p[0] + 26, p[1] - 20, 14, C.cyan, 'left', sm((t - TL.lock) / 0.3)); } }
+  if (handMid) label(LB.handoff, handMid[0], handMid[1] - 20, 15, C.cyan, 'center', env(t, TL.handoff + 0.1, TL.launch + 0.9, 0.3, 0.4) * hf);
+  if (IP && t < TL.hit) { const p = P2(c, IP); if (p) label(LB.launch, p[0] + 18, p[1] - 20, 13, C.cyan, 'left', env(t, TL.launch + 0.2, TL.hit - 0.3, 0.3, 0.4) * hf); }
+  // the pod close-up: EdgeGuide named on its AI core, and the core and the seeker named while the skin is see-through
+  const ea = (w2 || 0) * sm((t - TL.launch - 0.8) / 0.4) * (1 - sm((t - TL.zout2) / 0.4)); if (EGS && ea > 0.01) {
+    const cp = P2(c, ap(EGS.M, [0.17, 0, 0])), np = P2(c, ap(EGS.M, [1.1, 0, 0]));
+    vtag(ea, cp, LB.egTitle, LB.egSub, 150, -150);
+    if (cp && np && EGS.xr > 0.02) { const a = ea * EGS.xr; label(LB.core, cp[0], cp[1] + 34, 13, C.cyan, 'center', a); label(LB.seeker, np[0], np[1] + 30, 13, C.cyan, 'center', a); } }
+}
+
+/* ---------- the picture-in-picture: each sensor's own view, in white-hot thermal ---------- */
+const PIP = { x: 1372, y: 694, w: 420, h: 262 };
+function pipCam(k, t) {
+  const vp = PIP;
+  if (k === 'uas') { const U = uasAt(t), F = footprint(t) || [56, 46, 0]; if (!U) return null; return mkCam(va(U.p, [0, 0, -1.4]), [F[0], F[1], F[2] + 1.2], 25, vp); }
+  if (k === 'ffA' || k === 'ffB') { const ff = ffAim(k === 'ffA' ? ABR : BRD, t), o = lensP(ff), d = aimDir(ff); return mkCam(va(o, vk(d, 0.4)), va(o, vk(d, 60)), 9, vp); }
+  if (k === 'seeker') { const p = ipos(t); if (!p) return null; const tg = dpos(5, Math.min(t, TL.hit - 0.05)); return mkCam(p, tg, 17, vp); }
+  return null;
+}
+function irScene(c, t, k) {
+  const gr = g.createLinearGradient(0, PIP.y, 0, PIP.y + PIP.h); gr.addColorStop(0, 'rgb(14,14,14)'); gr.addColorStop(1, 'rgb(38,38,38)'); g.fillStyle = gr; g.fillRect(PIP.x, PIP.y, PIP.w, PIP.h);
+  const Gq = projPoly(c, [[-900, -900, 0], [900, -900, 0], [900, 900, 0], [-900, 900, 0]]); if (Gq) { path(Gq); g.closePath(); g.fillStyle = 'rgb(34,34,34)'; g.fill(); }
+  let s = projPoly(c, TOWNB); if (s) { path(s); g.closePath(); g.fillStyle = 'rgb(26,26,26)'; g.fill(); }
+  s = projPoly(c, ROADP); if (s) { path(s); g.closePath(); g.fillStyle = 'rgb(48,48,48)'; g.fill(); }
+  g.fillStyle = 'rgba(0,0,0,0.3)'; SHAD.forEach(P => { const q = projPoly(c, P); if (q) { path(q); g.closePath(); g.fill(); } });
+  const L = [], big = []; emitTown(L, c, 'ir'); emitVehicle(L, c, ABR, t, 'ir', k === 'ffA'); emitVehicle(L, c, BRD, t, 'ir', k === 'ffB'); emitPeople(L, c, t, 'ir'); emitCrates(L, c, 'ir');
+  const U = uasAt(t); if (U && k !== 'uas') emitUAS(L, c, U, 'ir');
+  for (let i = 0; i < 6; i++) if (alive(i, t) && droneBig(c, dpos(i, t))) big.push([i, emitDrone(L, c, i, t, 'ir')]);
+  paint(L, 'ir'); big.forEach(b => rotors(c, b[1], t, 'ir'));
+  for (let i = 0; i < 6; i++) { if (!alive(i, t)) continue; const P = dpos(i, t), p = P2(c, P); if (!p) continue;
+    if (big.some(b => b[0] === i)) { glow(p, clamp(c.F * 0.9 / p[2], 4, 90), '#FFFFFF', 0.2); continue; }
+    quad(p, clamp(c.F * 0.45 / p[2], 2.2, 60), sAng(c, P, dpos(i, t + 0.05)), '#FFFFFF', 1); glow(p, clamp(c.F * 0.9 / p[2], 4, 90), '#FFFFFF', 0.25); }
+  const IP = ipos(t); if (IP && t < TL.hit && k !== 'seeker') { const p = P2(c, IP); if (p) { glow(p, clamp(c.F * 0.8 / p[2], 4, 60), '#FFFFFF', 0.5); dart(p, sAng(c, IP, ipos(t + 0.05)), clamp(c.F * 0.35 / p[2], 2.5, 30), '#FFFFFF'); } }
+  const ffA = ffAim(ABR, t), ffB = ffAim(BRD, t); if (ffA.tgt >= 0) tracers(c, ffA, ffA.tgt, t, 'ir'); if (ffB.tgt >= 0) tracers(c, ffB, ffB.tgt, t, 'ir');
+  for (let i = 0; i < 6; i++) boom(c, KILL[i], t - DR[i].kill, 40 + i, 'ir');
+}
+function pipBox(c, P, r, color, id, sub, dashed) {
+  const p = P2(c, P); if (!p || p[0] < PIP.x - 20 || p[0] > PIP.x + PIP.w + 20 || p[1] < PIP.y - 20 || p[1] > PIP.y + PIP.h + 20) return;
+  const s = clamp(r * c.F / p[2], 7, 70); if (dashed) g.setLineDash([4, 3]);
+  g.strokeStyle = color; g.lineWidth = 1.6; g.strokeRect(p[0] - s, p[1] - s, 2 * s, 2 * s); g.setLineDash([]);
+  g.font = '700 12px ' + FONT; g.textAlign = 'left'; g.textBaseline = 'bottom'; g.letterSpacing = '1px';
+  const txt = sub ? id + ' · ' + sub : id, w = g.measureText(txt).width + 8, below = p[1] - s - 18 < PIP.y;   // near the top edge the tag goes under the box
+  const tx = clamp(p[0] - s, PIP.x + 2, PIP.x + PIP.w - w - 2), ty = below ? p[1] + s + 1 : p[1] - s - 16;
+  g.fillStyle = color; g.fillRect(tx, ty, w, 15); g.fillStyle = '#071E33'; g.fillText(txt, tx + 4, ty + 14); g.letterSpacing = '0px';
+}
+function drawPip(t) {
+  const fd = feed(t); if (!fd) return;
+  const c = pipCam(fd.k, t); if (!c) return;
+  const a = sm((t - 6.3) / 0.5), sight = fd.k === 'ffA' || fd.k === 'ffB';
+  g.save(); g.globalAlpha = a;
+  g.fillStyle = 'rgba(3,14,24,0.85)'; rr(PIP.x - 6, PIP.y - 6, PIP.w + 12, PIP.h + 12, 8); g.fill();
+  g.save(); rr(PIP.x, PIP.y, PIP.w, PIP.h, 4); g.clip();
+  irScene(c, t, fd.k);
+  if (!NZ) NZ = noiseTile();
+  const r = rng((t * 30) | 0); g.globalAlpha = a * 0.07; g.drawImage(NZ, -r() * 120, -r() * 80, 256, 160, PIP.x, PIP.y, PIP.w * 1.6, PIP.h * 1.6); g.globalAlpha = a;
+  g.fillStyle = 'rgba(0,0,0,0.12)'; for (let y = PIP.y; y < PIP.y + PIP.h; y += 3) g.fillRect(PIP.x, y, PIP.w, 1);
+  const cx = PIP.x + PIP.w / 2, cy = PIP.y + PIP.h / 2;
+  if (fd.k === 'uas') {
+    HOS.forEach((h, i) => { if (t >= DET[i]) pipBox(c, va(hosAt(i, t), [0, 0, 1.4]), 2.6, C.red, 'T' + (i + 1)); });
+    pipBox(c, [SQC[0], SQC[1], 1.4], 6.5, C.cyan, 'FRIENDLY');
+    for (let i = 0; i < 6; i++) if (alive(i, t)) pipBox(c, dpos(i, t), 1.8, i === 5 && t >= TL.handoff ? C.cyan : C.red, 'D' + (i + 1), i === 5 && t >= TL.handoff ? LB.handoff : '');
+  } else if (sight) {
+    g.strokeStyle = rgba(C.cyan, 0.8); g.lineWidth = 1.4; g.beginPath(); g.moveTo(cx - 34, cy); g.lineTo(cx - 10, cy); g.moveTo(cx + 10, cy); g.lineTo(cx + 34, cy); g.moveTo(cx, cy - 34); g.lineTo(cx, cy - 10); g.moveTo(cx, cy + 10); g.lineTo(cx, cy + 34); g.stroke();
+    const ff = ffAim(fd.k === 'ffA' ? ABR : BRD, t); if (ff.tgt >= 0) pipBox(c, dpos(ff.tgt, t), 1.6, C.cyan, 'D' + (ff.tgt + 1), ff.fire ? LB.engage : LB.track);
+  } else if (fd.k === 'seeker') {
+    g.strokeStyle = rgba(C.cyan, 0.75); g.lineWidth = 1.4; g.beginPath(); g.arc(cx, cy, 44, 0, TAU); g.stroke();
+    [0, 1, 2, 3].forEach(q => { const an = q * Math.PI / 2; g.beginPath(); g.moveTo(cx + Math.cos(an) * 50, cy + Math.sin(an) * 50); g.lineTo(cx + Math.cos(an) * 64, cy + Math.sin(an) * 64); g.stroke(); });
+    if (t < TL.hit) pipBox(c, dpos(5, t), 1.6, t >= TL.lock ? C.cyan : C.steel, 'D6', t >= TL.lock + 0.9 ? LB.homing : t >= TL.lock ? LB.lock : LB.cued, t < TL.lock);
+    const hd = t - TL.hit; if (hd > -0.12 && hd < 0.5) { g.fillStyle = 'rgba(255,255,255,' + (1 - clamp(hd / 0.5, 0, 1)) + ')'; g.fillRect(PIP.x, PIP.y, PIP.w, PIP.h); }
+  }
+  const sw = t - fd.t0; if (sw < 0.3 && fd.t0 > 6.3) { g.fillStyle = 'rgba(223,229,236,' + 0.55 * (1 - sw / 0.3) + ')'; g.fillRect(PIP.x, PIP.y, PIP.w, PIP.h); }
+  g.restore();
+  g.strokeStyle = rgba(C.cyan, 0.45); g.lineWidth = 1.5; rr(PIP.x, PIP.y, PIP.w, PIP.h, 4); g.stroke();
+  g.strokeStyle = C.cyan; g.lineWidth = 3; const L = 26, x0 = PIP.x - 7, y0 = PIP.y - 7, x1 = PIP.x + PIP.w + 7, y1 = PIP.y + PIP.h + 7;
+  [[x0, y0, 1, 1], [x1, y0, -1, 1], [x0, y1, 1, -1], [x1, y1, -1, -1]].forEach(([x, y, sx, sy]) => { g.beginPath(); g.moveTo(x, y + sy * L); g.lineTo(x, y); g.lineTo(x + sx * L, y); g.stroke(); });
+  const txt = fd.k === 'uas' ? LB.feedUas : sight ? LB.feedFF : LB.feedSeeker;
+  g.font = '700 14px ' + FONT; g.letterSpacing = '2px'; const w = g.measureText(txt).width;
+  g.fillStyle = 'rgba(5,23,38,0.86)'; g.fillRect(PIP.x + 10, PIP.y + PIP.h - 40, w + 52, 30); g.fillStyle = C.cyan; g.fillRect(PIP.x + 10, PIP.y + PIP.h - 40, 4, 30);
+  g.fillStyle = (t * 1.25) % 1 < 0.6 ? C.red : 'rgba(255,90,78,0.25)'; g.beginPath(); g.arc(PIP.x + 30, PIP.y + PIP.h - 25, 5, 0, TAU); g.fill();
+  g.fillStyle = C.white; g.textAlign = 'left'; g.textBaseline = 'middle'; g.fillText(txt, PIP.x + 44, PIP.y + PIP.h - 24); g.letterSpacing = '0px';
+  g.restore();
+}
+
+/* ---------- the vision rail: each product lights when it acts on its own (cyan), each link when the products work as
+   one system (green), then ONE SYSTEM; and the outcome ---------- */
+function rail(t) {
+  const ra = sm((t - 4.6) / 0.8); if (ra <= 0) return;
+  const y = 952, X = [152, 504, 856], XS = 1122;                       // node centres, the system mark (clear of the inset)
+  const NW = [[TL.scan, TL.share], [TL.swarm, TL.handoff], [TL.pod, TL.end]], LW = [[TL.share, TL.swarm], [TL.handoff, TL.pod]];
+  g.save(); g.globalAlpha = ra;
+  g.fillStyle = 'rgba(5,23,38,0.78)'; rr(X[0] - 36, y - 36, XS + 148 - (X[0] - 36), 72, 12); g.fill(); g.strokeStyle = rgba(C.cyan, 0.2); g.lineWidth = 1; g.stroke();
+  const link = (x0, x1, txt, on, done) => {
+    const col = on || done ? C.green : 'rgba(255,255,255,0.14)';
+    g.strokeStyle = on ? C.green : done ? rgba(C.green, 0.55) : col; g.lineWidth = on ? 3 : 2;
+    if (on) { g.save(); g.shadowColor = rgba(C.green, 0.8); g.shadowBlur = 12; }
+    g.beginPath(); g.moveTo(x0, y); g.lineTo(x1, y); g.stroke(); if (on) g.restore();
+    if (on) { const p = x0 + ((t * 0.6) % 1) * (x1 - x0); g.fillStyle = C.green; g.beginPath(); g.arc(p, y, 4, 0, TAU); g.fill(); }
+    if (txt) { g.font = '700 12px ' + FONT; g.letterSpacing = '2px'; g.textAlign = 'center'; g.textBaseline = 'middle';
+      g.fillStyle = on ? C.green : done ? rgba(C.green, 0.75) : 'rgba(255,255,255,0.3)'; g.fillText(txt, (x0 + x1) / 2, y - 16); g.letterSpacing = '0px'; }
+  };
+  LB.nodes.slice(0, 3).forEach((s, i) => {
+    const x = X[i], on = t >= NW[i][0] && t < NW[i][1], done = t >= NW[i][1], col = on || done ? C.cyan : 'rgba(255,255,255,0.24)';
+    if (i) link(X[i - 1] + 206, x - 26, LB.links[i - 1], t >= LW[i - 1][0] && t < LW[i - 1][1], t >= LW[i - 1][1]);
+    g.beginPath(); g.arc(x, y, 17, 0, TAU);
+    if (on) { glow([x, y], 36, C.cyan, 0.4); g.fillStyle = C.cyan; g.fill(); } else { g.strokeStyle = col; g.lineWidth = 2; g.stroke(); }
+    g.beginPath(); g.arc(x, y, 6, 0, TAU); g.fillStyle = on ? C.ink : col; g.fill();
+    g.textAlign = 'left'; g.textBaseline = 'middle'; g.font = '700 17px ' + FONT; g.letterSpacing = '2px';
+    g.fillStyle = on ? C.white : done ? C.text2 : 'rgba(255,255,255,0.32)'; g.fillText(s.title, x + 28, y - 10); g.letterSpacing = '0px';
+    g.font = '400 15px ' + FONT; g.fillStyle = on ? C.cyan : done ? C.steel : 'rgba(255,255,255,0.26)'; g.fillText(s.sub, x + 28, y + 12);
+  });
+  const sys = t >= TL.end;
+  link(X[2] + 206, XS - 14, '', sys, false);
+  g.font = '700 16px ' + FONT; g.letterSpacing = '3px'; const tw = g.measureText(LB.system).width + 36;
+  rr(XS - 14, y - 19, tw, 38, 19); if (sys) { g.save(); g.shadowColor = rgba(C.green, 0.8); g.shadowBlur = 18; g.fillStyle = rgba(C.green, 0.16); g.fill(); g.restore(); }
+  g.strokeStyle = sys ? C.green : 'rgba(255,255,255,0.2)'; g.lineWidth = 2; g.stroke();
+  g.fillStyle = sys ? C.green : 'rgba(255,255,255,0.3)'; g.textAlign = 'left'; g.textBaseline = 'middle'; g.fillText(LB.system, XS + 4, y + 1); g.letterSpacing = '0px';
+  g.restore();
+}
+function outcome(t) {                                                   // the one green element: the swarm is down, the squad is safe
+  const a = sm((t - TL.end) / 0.6); if (a <= 0) return;
+  const x = PIP.x, y = PIP.y - 64;
+  g.globalAlpha = a; g.font = '700 18px ' + FONT; g.letterSpacing = '3px'; const w = g.measureText(LB.done).width + 76;
+  g.fillStyle = 'rgba(5,23,38,0.82)'; rr(x, y, w, 44, 22); g.fill(); g.strokeStyle = C.green; g.lineWidth = 2; g.stroke();
+  g.strokeStyle = C.green; g.lineWidth = 3; g.lineCap = 'round'; g.beginPath(); g.moveTo(x + 22, y + 22); g.lineTo(x + 29, y + 29); g.lineTo(x + 42, y + 15); g.stroke(); g.lineCap = 'butt';
+  g.fillStyle = C.green; g.textAlign = 'left'; g.textBaseline = 'middle'; g.fillText(LB.done, x + 56, y + 23); g.letterSpacing = '0px'; g.globalAlpha = 1;
+}
+
+/* ---------- the loop, beats, and the deck's keys ---------- */
+function draw(t) {
+  size(); if (!BG) BG = background();
+  g.setTransform(1, 0, 0, 1, 0, 0); g.globalAlpha = 1; g.globalCompositeOperation = 'source-over'; g.drawImage(BG, 0, 0);
+  g.setTransform(K, 0, 0, K, OX, OY);
+  scene(t); drawPip(t); rail(t); outcome(t);
+}
+const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
+let T0 = null, OFF = 0, NOW = 0;
+const clock = () => T0 === null ? OFF : (performance.now() - T0) / 1000 + OFF;
+function setT(t) { const now = performance.now(); if (T0 === null) T0 = now; OFF = t - (now - T0) / 1000; }
+function step(dir) {                                                    // a forward key jumps to the next beat; back returns one
+  const t = clock();
+  if (dir > 0) { const nx = PH.find(p => p > t + 0.25); if (nx == null) return false; setT(nx); return true; }
+  let k = 0; PH.forEach((p, i) => { if (t >= p) k = i; });
+  if (k === 0) return false; setT(PH[k - 1]); return true;
+}
+function frame(now) { if (T0 === null) T0 = now; NOW = (now - T0) / 1000 + OFF; draw(NOW); requestAnimationFrame(frame); }
+window.__cl = { clock, setT, step, PH, TL, draw };
+if (A.freeze != null) { draw(+A.freeze); addEventListener('resize', () => draw(+A.freeze)); }
+else if (reduced) { const s = A.still != null ? +A.still : TL.end + 1.5; draw(s); addEventListener('resize', () => draw(s)); }
+else { requestAnimationFrame(frame); window.deckStep = step; }           // the deck engine asks here before it changes slide
+</script></body></html>
